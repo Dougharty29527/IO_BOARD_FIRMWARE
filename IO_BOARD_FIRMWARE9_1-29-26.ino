@@ -448,31 +448,8 @@ const unsigned long FLUSH_INTERVAL = 30 * 1000;
  *   printWatchdogBanner("REBOOT ATTEMPT #1");
  */
 void printWatchdogBanner(const char* message) {
-    Serial.println("\n");
-    Serial.println("╔══════════════════════════════════════════════════════════════════════════════╗");
-    Serial.println("║  ██╗    ██╗ █████╗ ████████╗ ██████╗██╗  ██╗██████╗  ██████╗  ██████╗       ║");
-    Serial.println("║  ██║    ██║██╔══██╗╚══██╔══╝██╔════╝██║  ██║██╔══██╗██╔═══██╗██╔════╝       ║");
-    Serial.println("║  ██║ █╗ ██║███████║   ██║   ██║     ███████║██║  ██║██║   ██║██║  ███╗      ║");
-    Serial.println("║  ██║███╗██║██╔══██║   ██║   ██║     ██╔══██║██║  ██║██║   ██║██║   ██║      ║");
-    Serial.println("║  ╚███╔███╔╝██║  ██║   ██║   ╚██████╗██║  ██║██████╔╝╚██████╔╝╚██████╔╝      ║");
-    Serial.println("║   ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚═════╝  ╚═════╝  ╚═════╝       ║");
-    Serial.println("╠══════════════════════════════════════════════════════════════════════════════╣");
-    Serial.print("║  🚨🚨🚨 ");
-    Serial.print(message);
-    // Pad the message to fill the line
-    int msgLen = strlen(message);
-    for (int i = msgLen; i < 65; i++) Serial.print(" ");
-    Serial.println("🚨🚨🚨 ║");
-    Serial.println("╠══════════════════════════════════════════════════════════════════════════════╣");
-    Serial.print("║  Device: ");
-    Serial.print(deviceName);
-    for (int i = strlen(deviceName); i < 60; i++) Serial.print(" ");
-    Serial.println("      ║");
-    Serial.print("║  Reboot Attempts: ");
-    Serial.print(watchdogRebootAttempts);
-    Serial.println("                                                         ║");
-    Serial.println("╚══════════════════════════════════════════════════════════════════════════════╝");
-    Serial.println("\n");
+    Serial.printf("[WATCHDOG] %s (Device: %s, Attempts: %d)\r\n", 
+                  message, deviceName, watchdogRebootAttempts);
 }
 
 /**
@@ -488,40 +465,25 @@ void printWatchdogBanner(const char* message) {
  *   pulseWatchdogPin(30000);  // 30 second pulse
  */
 void pulseWatchdogPin(unsigned long pulseDuration) {
-    char msgBuffer[80];
-    snprintf(msgBuffer, sizeof(msgBuffer), "REBOOTING EXTERNAL DEVICE - %lu SECOND PULSE", pulseDuration / 1000);
-    printWatchdogBanner(msgBuffer);
-    
-    Serial.println("████████████████████████████████████████████████████████████████████████████████");
-    Serial.println("██                                                                            ██");
-    Serial.print("██  >>> GPIO39 GOING HIGH NOW - PULSE DURATION: ");
-    Serial.print(pulseDuration / 1000);
-    Serial.println(" SECONDS <<<                  ██");
-    Serial.println("██                                                                            ██");
-    Serial.println("████████████████████████████████████████████████████████████████████████████████");
+    Serial.printf("[WATCHDOG] GPIO39 HIGH - %lu sec pulse (Device: %s, Attempt #%d)\r\n", 
+                  pulseDuration / 1000, deviceName, watchdogRebootAttempts);
     
     digitalWrite(ESP_WATCHDOG_PIN, HIGH);
     
-    // For long pulses, print countdown every 5 seconds
+    // For long pulses, print status every 10 seconds
     if (pulseDuration > 5000) {
         unsigned long startTime = millis();
         while (millis() - startTime < pulseDuration) {
             unsigned long remaining = (pulseDuration - (millis() - startTime)) / 1000;
-            Serial.print("⏳ Power cycle in progress... ");
-            Serial.print(remaining);
-            Serial.println(" seconds remaining");
-            delay(5000);
+            Serial.printf("[WATCHDOG] Power cycle... %lu sec remaining\r\n", remaining);
+            delay(10000);
         }
     } else {
         delay(pulseDuration);
     }
     
     digitalWrite(ESP_WATCHDOG_PIN, LOW);
-    
-    Serial.println("████████████████████████████████████████████████████████████████████████████████");
-    Serial.println("██  ✓ GPIO39 RETURNED TO LOW - PULSE COMPLETE                                 ██");
-    Serial.println("██  ✓ WAITING FOR EXTERNAL DEVICE TO REBOOT AND RESUME SERIAL DATA           ██");
-    Serial.println("████████████████████████████████████████████████████████████████████████████████\n");
+    Serial.println("[WATCHDOG] GPIO39 LOW - pulse complete, waiting for serial data");
 }
 
 /**
@@ -556,13 +518,8 @@ void checkSerialWatchdog() {
         if (!watchdogTriggered) {
             watchdogTriggered = true;
             lastWatchdogPulseTime = 0;  // Force immediate first pulse
-            
-            Serial.println("\n⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️");
-            Serial.print("⚠️ SERIAL WATCHDOG ACTIVATED: No data received for ");
-            Serial.print(timeSinceLastData / 60000);
-            Serial.println(" minutes!");
-            Serial.println("⚠️ Will send zeroed data with fault code 1024 until serial resumes");
-            Serial.println("⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️\n");
+            Serial.printf("[WATCHDOG] ACTIVATED - no data for %lu min, fault code 1024\r\n", 
+                          timeSinceLastData / 60000);
         }
         
         // Check if it's time for another reboot attempt (every 30 minutes)
@@ -575,12 +532,8 @@ void checkSerialWatchdog() {
             unsigned long pulseDuration;
             if (watchdogRebootAttempts == 1) {
                 pulseDuration = WATCHDOG_FIRST_PULSE;  // 1 second
-                Serial.println("\n🔄 FIRST REBOOT ATTEMPT - Using short 1-second pulse");
             } else {
                 pulseDuration = WATCHDOG_LONG_PULSE;   // 30 seconds
-                Serial.print("\n🔄 REBOOT ATTEMPT #");
-                Serial.print(watchdogRebootAttempts);
-                Serial.println(" - Using extended 30-second power cycle");
             }
             
             // Trigger the watchdog pulse
@@ -589,9 +542,7 @@ void checkSerialWatchdog() {
             // Record when we pulsed
             lastWatchdogPulseTime = millis();
             
-            Serial.print("📅 Next reboot attempt in 30 minutes if serial data doesn't resume\n");
-            Serial.print("📊 Total reboot attempts so far: ");
-            Serial.println(watchdogRebootAttempts);
+            Serial.printf("[WATCHDOG] Next attempt in 30 min if no serial data\r\n");
         }
     }
 }
