@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 9.3
+ *  Walter IO Board Firmware - Rev 9.3a
  *  Date: 2/5/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -12,6 +12,20 @@
  *  =====================================================================
  *  REVISION HISTORY
  *  =====================================================================
+ *  
+ *  Rev 9.3a (2/5/2026) - Critical Safety Fixes
+ *  - FIXED: DISP_SHUTDN relay randomly turning off
+ *    * gpioA_value now initialized to 0x10 (V6 ON) to match physical state
+ *    * I2C handler forces bit 4 ON during 20-second protection period
+ *    * set_relay_mode() now preserves V6 state instead of overwriting
+ *    * Web /setrelays endpoint always preserves V6 state (can only change via I2C)
+ *  - FIXED: False overfill alarms on ESP32 reboot
+ *    * Multi-layer protection: variables reset in setup(), task, and passthrough boot
+ *    * I2C handler returns 0x00 for GPIOB during 15-second startup lockout
+ *    * GPIO38 pull-up configured before I2C slave initialization
+ *  - FIXED: Serial output corruption from MCP emulator thread
+ *    * Removed all Serial.print calls from Core 0 functions
+ *    * Affects: I2C handlers, bus recovery, health check, overfill/DISP protection
  *  
  *  Rev 9.3 (2/5/2026) - Preference-Based Passthrough Boot Mode
  *  - Passthrough now uses preference-based boot strategy for clean modem access
@@ -128,7 +142,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 9.3"
+#define VERSION "Rev 9.3a"
 String ver = VERSION;
 
 // ### Libraries ###
@@ -205,7 +219,8 @@ String mode_names[] = {"Idle", "Run", "Purge", "Burp"};
 
 // MCP emulator global variables (protected by mutex)
 // Note: Real MCP23017 defaults IODIR to 0xFF (all inputs), but we override for our application
-volatile uint8_t gpioA_value = 0x00;
+// CRITICAL: gpioA_value bit 4 (0x10) = DISP_SHUTDN - MUST start ON to match physical state
+volatile uint8_t gpioA_value = 0x10;  // V6/DISP_SHUTDN starts ON
 volatile uint8_t gpioB_value = 0x00;
 volatile uint8_t iodirA_value = 0x00;  // 0x00 = All OUTPUT (GPA0-GPA4 are relay outputs)
 volatile uint8_t iodirB_value = 0x01;  // 0x01 = GPB0 is INPUT (overfill sensor)
@@ -231,13 +246,19 @@ unsigned long overfillCheckTimer = 0;
 uint8_t overfillLowCount = 0;
 bool overfillAlarmActive = false;
 
-// Overfill validation system - prevents false alarms during power cycles/flashes
+// Overfill validation system - prevents false alarms during power cycles/flashes/reboots
 // The GPIO38 input can have transient states during startup before pull-up stabilizes
+// PROTECTION LAYERS:
+//   1. gpioB_value initialized to 0x00 (no alarm) and explicitly reset on task start
+//   2. overfillValidationComplete=false until 15 seconds after boot
+//   3. I2C handler returns 0x00 for GPIOB if !overfillValidationComplete
+//   4. Require 8 consecutive LOW readings (8 seconds) to trigger alarm
+//   5. Require 5 consecutive HIGH readings (5 seconds) to clear alarm (hysteresis)
 bool overfillValidationComplete = false;    // True after startup validation period
 unsigned long overfillStartupTime = 0;      // When overfill monitoring started
 const unsigned long OVERFILL_STARTUP_LOCKOUT = 15000;  // 15 second lockout after boot
-const uint8_t OVERFILL_TRIGGER_COUNT = 8;   // Consecutive LOW readings to trigger (was 5)
-const uint8_t OVERFILL_CLEAR_COUNT = 5;     // Consecutive HIGH readings to clear (was 3)
+const uint8_t OVERFILL_TRIGGER_COUNT = 8;   // Consecutive LOW readings to trigger
+const uint8_t OVERFILL_CLEAR_COUNT = 5;     // Consecutive HIGH readings to clear
 
 // DISP_SHUTDN (V6) Protection System - CRITICAL SAFETY RELAY
 // This relay controls site shutdown - MUST default to ON (HIGH)
@@ -667,9 +688,7 @@ void setRelayStateSafe(uint8_t relayMask) {
     } else {
         // Mutex timeout - log error but still try to set relays
         // This shouldn't happen in normal operation
-        if (i2cDebugEnabled) {
-            Serial.println("WARNING: setRelayStateSafe mutex timeout");
-        }
+        // Note: Serial output removed - may run from Core 0 context
         gpioA_value = relayMask;
         digitalWrite(CR0_MOTOR, (relayMask & 0x01) ? HIGH : LOW);
         digitalWrite(CR1, (relayMask & 0x02) ? HIGH : LOW);
@@ -727,11 +746,10 @@ void set_relay_mode(RunMode mode) {
             break;
     }
     
-    // V6 (bit 4, 0x10) MUST stay ON during QC test mode and web operations
-    // V6 can only be turned off via explicit I2C command from the master
-    if (qcModeActive || webOverrideActive) {
-        relay_pattern |= 0x10;  // Force V6 ON
-    }
+    // V6 (bit 4, 0x10) MUST stay ON - can ONLY be turned off via explicit I2C command
+    // CRITICAL: ALWAYS preserve V6 state from current gpioA_value unless I2C explicitly clears it
+    // This function is for web/QC control of relays 0-3, NOT for V6 control
+    relay_pattern |= (gpioA_value & 0x10);  // Preserve current V6 state
     
     setRelayStateSafe(relay_pattern);
     
@@ -769,7 +787,7 @@ void mcpReadInputsFromPhysicalPins() {
     // Initialize startup time on first call
     if (overfillStartupTime == 0) {
         overfillStartupTime = currentMillis;
-        Serial.println("[Overfill] Validation system starting - 15 second lockout");
+        // Note: Serial output removed - runs on Core 0, corrupts Core 1 output
     }
     
     // STARTUP LOCKOUT: Don't process readings for first 15 seconds
@@ -780,9 +798,7 @@ void mcpReadInputsFromPhysicalPins() {
             overfillLowCount = 0;
             overfillHighCount = 0;
             overfillAlarmActive = false;  // Start with alarm OFF after validation
-            Serial.println("[Overfill] ✓ Validation complete - monitoring enabled");
-            Serial.print("[Overfill] Current GPIO38 state: ");
-            Serial.println(digitalRead(ESP_OVERFILL) == HIGH ? "HIGH (normal)" : "LOW (sensor active)");
+            // Note: Serial output removed - runs on Core 0
         } else {
             // During lockout, just set gpioB to normal (no alarm)
             gpioB_value = 0x00;
@@ -804,10 +820,7 @@ void mcpReadInputsFromPhysicalPins() {
             // Require OVERFILL_TRIGGER_COUNT consecutive LOW readings to trigger alarm
             if (overfillLowCount >= OVERFILL_TRIGGER_COUNT && !overfillAlarmActive) {
                 overfillAlarmActive = true;
-                Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-                Serial.println("║  🚨 OVERFILL ALARM ACTIVATED                          ║");
-                Serial.printf("║  %d consecutive LOW readings on GPIO38                 ║\n", OVERFILL_TRIGGER_COUNT);
-                Serial.println("╚═══════════════════════════════════════════════════════╝\n");
+                // Note: Serial output removed - runs on Core 0
             }
         } else {
             // Normal state (HIGH due to pull-up)
@@ -817,10 +830,7 @@ void mcpReadInputsFromPhysicalPins() {
             // Require OVERFILL_CLEAR_COUNT consecutive HIGH readings to clear alarm (hysteresis)
             if (overfillHighCount >= OVERFILL_CLEAR_COUNT && overfillAlarmActive) {
                 overfillAlarmActive = false;
-                Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-                Serial.println("║  ✅ OVERFILL ALARM CLEARED                            ║");
-                Serial.printf("║  %d consecutive HIGH readings on GPIO38                ║\n", OVERFILL_CLEAR_COUNT);
-                Serial.println("╚═══════════════════════════════════════════════════════╝\n");
+                // Note: Serial output removed - runs on Core 0
             }
         }
         
@@ -853,22 +863,20 @@ void checkDispShutdownProtection() {
         dispShutdownProtectionActive = true;
         // Force DISP_SHUTDN ON immediately
         digitalWrite(DISP_SHUTDN, HIGH);
-        Serial.println("[DISP_SHUTDN] ⚡ Protection ACTIVE - relay FORCED ON for 20 seconds");
+        // Note: Serial output removed - runs on Core 0
     }
     
     // Check if lockout period has expired
     if (dispShutdownProtectionActive) {
         if (currentMillis - dispShutdownStartupTime >= DISP_SHUTDN_LOCKOUT) {
             dispShutdownProtectionActive = false;
-            Serial.println("[DISP_SHUTDN] ✓ Protection expired - MCP/web control enabled");
-            Serial.print("[DISP_SHUTDN] Current gpioA bit 4: ");
-            Serial.println((gpioA_value & 0x10) ? "ON (HIGH)" : "OFF (LOW)");
+            // Note: Serial output removed - runs on Core 0
         } else {
             // Still in lockout - ensure relay stays ON
             // This catches any edge cases where the relay might have been set LOW
             if (digitalRead(DISP_SHUTDN) == LOW) {
                 digitalWrite(DISP_SHUTDN, HIGH);
-                Serial.println("[DISP_SHUTDN] ⚠️ Relay was LOW during protection - forced back ON");
+                // Note: Serial output removed - runs on Core 0
             }
         }
     }
@@ -887,35 +895,38 @@ bool mcpWriteOutputsToPhysicalPins() {
         return false; // Web has priority - ignore I2C relay commands
     }
     
+    // Capture gpioA_value atomically ONCE at the start
+    // This prevents race conditions where value changes mid-function
+    uint8_t capturedValue = gpioA_value;
+    
     // DISP_SHUTDN Protection: Determine what state V6 should be in
     // During protection period, ALWAYS force HIGH (ON) regardless of MCP command
     bool dispShutdownState;
     if (dispShutdownProtectionActive) {
         dispShutdownState = HIGH;  // Protection active - FORCE ON
     } else {
-        // Protection expired - allow MCP command (bit 4 of gpioA_value)
-        dispShutdownState = (gpioA_value & 0x10) ? HIGH : LOW;
+        // Protection expired - allow MCP command (bit 4 of captured value)
+        dispShutdownState = (capturedValue & 0x10) ? HIGH : LOW;
     }
     
     // Write to physical pins with minimal mutex wait (1ms max)
     // I2C callbacks must respond quickly to avoid bus timeouts
     if (relayMutex != NULL && xSemaphoreTake(relayMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
-        digitalWrite(CR0_MOTOR, (gpioA_value & 0x01) ? HIGH : LOW);
-        digitalWrite(CR1, (gpioA_value & 0x02) ? HIGH : LOW);
-        digitalWrite(CR2, (gpioA_value & 0x04) ? HIGH : LOW);
-        digitalWrite(CR5, (gpioA_value & 0x08) ? HIGH : LOW);
+        digitalWrite(CR0_MOTOR, (capturedValue & 0x01) ? HIGH : LOW);
+        digitalWrite(CR1, (capturedValue & 0x02) ? HIGH : LOW);
+        digitalWrite(CR2, (capturedValue & 0x04) ? HIGH : LOW);
+        digitalWrite(CR5, (capturedValue & 0x08) ? HIGH : LOW);
         // V6 (DISP_SHUTDN) - protected during startup
         digitalWrite(DISP_SHUTDN, dispShutdownState);
         xSemaphoreGive(relayMutex);
         return true;
     } else {
         // Mutex busy - write anyway to keep I2C responsive
-        // Single-byte volatile writes are atomic on ESP32
-        uint8_t val = gpioA_value;
-        digitalWrite(CR0_MOTOR, (val & 0x01) ? HIGH : LOW);
-        digitalWrite(CR1, (val & 0x02) ? HIGH : LOW);
-        digitalWrite(CR2, (val & 0x04) ? HIGH : LOW);
-        digitalWrite(CR5, (val & 0x08) ? HIGH : LOW);
+        // Use the captured value for consistency
+        digitalWrite(CR0_MOTOR, (capturedValue & 0x01) ? HIGH : LOW);
+        digitalWrite(CR1, (capturedValue & 0x02) ? HIGH : LOW);
+        digitalWrite(CR2, (capturedValue & 0x04) ? HIGH : LOW);
+        digitalWrite(CR5, (capturedValue & 0x08) ? HIGH : LOW);
         // V6 (DISP_SHUTDN) - protected during startup
         digitalWrite(DISP_SHUTDN, dispShutdownState);
         return true;
@@ -953,12 +964,7 @@ void handleI2CWrite(int numBytes) {
         numBytes--;
         lastRegisterAccessed = reg;
         
-        if (i2cDebugEnabled) {
-            Serial.print("I2C WRITE: Reg 0x");
-            Serial.print(reg, HEX);
-            Serial.print(" = 0x");
-            Serial.println(value, HEX);
-        }
+        // Note: I2C debug removed - I2C callbacks run on Core 0, corrupt Core 1 serial
         
         switch (reg) {
             case IODIRA:
@@ -971,6 +977,12 @@ void handleI2CWrite(int numBytes) {
                 
             case GPIOA:
             case OLATA:
+                // CRITICAL: During protection period, FORCE bit 4 (DISP_SHUTDN) to stay ON
+                // This ensures the master cannot accidentally turn off the site during startup
+                if (dispShutdownProtectionActive) {
+                    value |= 0x10;  // Force V6 bit ON regardless of what master sent
+                }
+                
                 // Write to gpioA_value with short mutex timeout
                 // I2C callbacks must be fast - use 1ms timeout max
                 if (relayMutex != NULL && xSemaphoreTake(relayMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
@@ -1029,56 +1041,35 @@ void handleI2CRead() {
     i2cTransactionCount++;
     lastRegisterAccessed = registerPointer;
     
-    if (i2cDebugEnabled) {
-        Serial.print("I2C READ: Reg 0x");
-        Serial.print(registerPointer, HEX);
-    }
+    // Note: I2C debug removed - I2C callbacks run on Core 0, corrupt Core 1 serial
     
     switch (registerPointer) {
         case IODIRA:
             Wire.write(iodirA_value);
             Wire.write(iodirB_value);
-            if (i2cDebugEnabled) {
-                Serial.print(" = 0x");
-                Serial.print(iodirA_value, HEX);
-                Serial.print(", 0x");
-                Serial.println(iodirB_value, HEX);
-            }
             break;
             
         case IODIRB:
             Wire.write(iodirB_value);
-            if (i2cDebugEnabled) {
-                Serial.print(" = 0x");
-                Serial.println(iodirB_value, HEX);
-            }
             break;
             
         case GPIOA:
             {
                 uint8_t byteA = getRelayStateSafe(); // Thread-safe read
-                uint8_t byteB = gpioB_value;
-                
+                // CRITICAL: During startup lockout, ALWAYS report no overfill
+                // This prevents false alarms from transient GPIO38 states
+                uint8_t byteB = overfillValidationComplete ? gpioB_value : 0x00;
                 Wire.write(byteA);
                 Wire.write(byteB);
-                
-                if (i2cDebugEnabled) {
-                    Serial.print(" = 0x");
-                    Serial.print(byteA, HEX);
-                    Serial.print(", 0x");
-                    Serial.println(byteB, HEX);
-                }
             }
             break;
             
         case GPIOB:
             {
-                uint8_t byteB = gpioB_value;
+                // CRITICAL: During startup lockout, ALWAYS report no overfill
+                // This prevents false alarms from transient GPIO38 states
+                uint8_t byteB = overfillValidationComplete ? gpioB_value : 0x00;
                 Wire.write(byteB);
-                if (i2cDebugEnabled) {
-                    Serial.print(" = 0x");
-                    Serial.println(byteB, HEX);
-                }
             }
             break;
             
@@ -1087,19 +1078,11 @@ void handleI2CRead() {
                 uint8_t byteA = getRelayStateSafe(); // Thread-safe read
                 Wire.write(byteA);
                 Wire.write(0x00);
-                if (i2cDebugEnabled) {
-                    Serial.print(" = 0x");
-                    Serial.print(byteA, HEX);
-                    Serial.println(", 0x00");
-                }
             }
             break;
             
         case OLATB:
             Wire.write(0x00);
-            if (i2cDebugEnabled) {
-                Serial.println(" = 0x00");
-            }
             break;
             
         // Return stored values for other registers
@@ -1122,9 +1105,6 @@ void handleI2CRead() {
             
         default:
             Wire.write(0x00);
-            if (i2cDebugEnabled) {
-                Serial.println(" = 0x00 (default)");
-            }
             break;
     }
     
@@ -1152,7 +1132,7 @@ const unsigned long I2C_STALE_THRESHOLD = 120000;       // Consider stale after 
  * Usage: Call before Wire.begin() at startup or when bus errors detected
  */
 void i2cBusRecovery() {
-    Serial.println("[I2C] Performing bus recovery...");
+    // Note: Serial output removed - runs on Core 0, corrupts Core 1 output
     
     // Temporarily configure pins as GPIO
     pinMode(SDA_PIN, INPUT_PULLUP);
@@ -1160,8 +1140,6 @@ void i2cBusRecovery() {
     
     // Check if SDA is stuck LOW
     if (digitalRead(SDA_PIN) == LOW) {
-        Serial.println("[I2C] SDA stuck LOW - attempting recovery");
-        
         // Toggle SCL up to 9 times to free the bus
         for (int i = 0; i < 9; i++) {
             digitalWrite(SCL_PIN, LOW);
@@ -1171,7 +1149,6 @@ void i2cBusRecovery() {
             
             // Check if SDA is released
             if (digitalRead(SDA_PIN) == HIGH) {
-                Serial.printf("[I2C] SDA released after %d clock pulses\n", i + 1);
                 break;
             }
         }
@@ -1184,10 +1161,6 @@ void i2cBusRecovery() {
         delayMicroseconds(5);
         digitalWrite(SDA_PIN, HIGH);
         delayMicroseconds(5);
-        
-        Serial.println("[I2C] STOP condition generated");
-    } else {
-        Serial.println("[I2C] Bus OK - SDA is HIGH");
     }
     
     // Brief delay before reinitializing
@@ -1212,8 +1185,7 @@ void initI2CSlave() {
     i2cBusHealthy = true;
     i2cTransactionCount = 0;
     i2cErrorCount = 0;
-    
-    Serial.println("[I2C] ✓ Slave initialized at address 0x20");
+    // Note: Serial output removed - runs on Core 0
 }
 
 /**
@@ -1221,8 +1193,7 @@ void initI2CSlave() {
  * Use when bus appears stuck or after errors
  */
 void resetI2CSlave() {
-    Serial.println("[I2C] Resetting I2C slave...");
-    
+    // Note: Serial output removed - runs on Core 0
     Wire.end();
     delay(50);  // Longer delay to let bus settle
     
@@ -1244,28 +1215,46 @@ void checkI2CHealth() {
     // Check for error conditions that warrant a reset
     // If we have errors but no successful transactions, bus might be stuck
     if (i2cErrorCount > 10 && i2cTransactionCount == 0) {
-        Serial.println("[I2C] ⚠️ High error count with no transactions - resetting bus");
+        // Note: Serial output removed - runs on Core 0
         resetI2CSlave();
         return;
     }
     
     // Check if SDA is stuck LOW (indicating a stuck slave condition)
     // Only check if we haven't had recent activity
-    if (now - i2cLastActivity > I2C_STALE_THRESHOLD) {
-        // Temporarily check SDA state without disrupting Wire
-        // This is informational only - we don't auto-reset just for inactivity
-        // because the master might simply not be communicating
-        if (i2cDebugEnabled) {
-            Serial.println("[I2C] No activity for 2+ minutes (master may be disconnected)");
-        }
-    }
+    // This is informational only - we don't auto-reset just for inactivity
+    // because the master might simply not be communicating
 }
 
 // =====================================================================
 // MCP EMULATOR FREERTOS TASK
 // =====================================================================
 void mcpEmulatorTask(void *parameter) {
-    // Configure relay output pins
+    // =========================================================================
+    // CRITICAL: Initialize all MCP state BEFORE I2C starts accepting requests
+    // This prevents false alarms and incorrect relay states during boot
+    // =========================================================================
+    
+    // STEP 1: Force overfill state to SAFE (no alarm) FIRST
+    // This ensures any I2C read before full init returns correct value
+    gpioB_value = 0x00;                    // NO overfill alarm
+    overfillAlarmActive = false;           // Alarm flag OFF
+    overfillValidationComplete = false;    // Force lockout period
+    overfillStartupTime = 0;               // Will be set on first check
+    overfillLowCount = 0;                  // Reset trigger counter
+    overfillHighCount = 0;                 // Reset clear counter  
+    overfillCheckTimer = 0;                // Reset check timer
+    
+    // STEP 2: Configure overfill input pin EARLY with pull-up
+    // Do this BEFORE relay outputs to give pull-up time to stabilize
+    // Overfill sensor is active-LOW (pulled LOW when overfill detected)
+    // Internal pull-up keeps line HIGH when sensor not active, prevents floating
+    pinMode(ESP_OVERFILL, INPUT_PULLUP);
+    
+    // Brief delay to let pull-up stabilize GPIO38
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+    
+    // STEP 3: Configure relay output pins
     pinMode(CR0_MOTOR, OUTPUT);
     pinMode(CR1, OUTPUT);
     pinMode(CR2, OUTPUT);
@@ -1280,12 +1269,17 @@ void mcpEmulatorTask(void *parameter) {
     // V6 is ACTIVE HIGH: HIGH = ON, LOW = OFF
     digitalWrite(DISP_SHUTDN, HIGH);
     
-    // Configure overfill input pin with internal pull-up
-    // Overfill sensor is active-LOW (pulled LOW when overfill detected)
-    // Internal pull-up keeps line HIGH when sensor not active, prevents floating
-    pinMode(ESP_OVERFILL, INPUT_PULLUP);
+    // STEP 4: Ensure gpioA_value matches physical state
+    // gpioA_value MUST have bit 4 set to reflect DISP_SHUTDN = ON
+    // This prevents I2C read-back issues where master thinks V6 is OFF
+    gpioA_value = 0x10;  // Only V6/DISP_SHUTDN ON, all others OFF
     
-    // Initialize I2C slave with bus recovery
+    // STEP 5: Reset DISP_SHUTDN protection state
+    dispShutdownProtectionActive = true;   // Enable protection
+    dispShutdownStartupTime = 0;           // Will be set on first check
+    
+    // STEP 6: Initialize I2C slave with bus recovery
+    // ONLY after all state is properly initialized
     // This clears any stuck conditions from previous power cycle
     initI2CSlave();
     
@@ -1332,7 +1326,7 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Walter IO Board - Rev 9.2</title>
+    <title>Walter IO Board - Rev 9.3a</title>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -1428,7 +1422,7 @@ const char* control_html = R"rawliteral(
     </div>
     <div class="connection-status connected" id="connectionStatus">Connected</div>
     <h1>Walter IO Board Firmware</h1>
-    <p class="subtitle">Rev 9.2b Control Panel</p>
+    <p class="subtitle">Rev 9.3a Control Panel</p>
     <div class="panel">
         <h2>System Status</h2>
         <div class="status-grid">
@@ -1918,17 +1912,17 @@ void startConfigAP() {
     });
     
     // Set individual relays endpoint
-    // NOTE: V6 (bit 4) is forced ON during QC mode - can only be turned off via I2C
+    // CRITICAL: V6 (bit 4, DISP_SHUTDN) can ONLY be turned off via explicit I2C command
+    // Web interface ALWAYS preserves current V6 state for safety
     server.on("/setrelays", HTTP_GET, [](AsyncWebServerRequest *request){
         if (request->hasParam("mask")) {
             uint8_t mask = request->getParam("mask")->value().toInt();
             webOverrideActive = true;
             lastWebActivity = millis();
             
-            // V6 MUST stay ON during QC mode - force bit 4 high
-            if (qcModeActive) {
-                mask |= 0x10;  // Force V6 ON
-            }
+            // CRITICAL: ALWAYS preserve V6 state - web cannot turn off DISP_SHUTDN
+            // V6 can ONLY be controlled via I2C from the Linux master
+            mask = (mask & 0x0F) | (gpioA_value & 0x10);  // Keep bits 0-3 from request, bit 4 from current
             
             setRelayStateSafe(mask);
             request->send(200, "text/plain", "Relays set to 0x" + String(mask, HEX));
@@ -3487,6 +3481,21 @@ void runPassthroughBootMode(unsigned long timeoutMinutes) {
     Serial.printf("\n[PASSTHROUGH] Boot mode active - timeout %lu min\r\n", timeoutMinutes);
     Serial.println("[PASSTHROUGH] Exit: MCP GPA5 via I2C, or send +++STOPPPP");
     
+    // CRITICAL: Pre-initialize overfill state to SAFE before anything else
+    // This ensures no false alarms even if I2C is queried early
+    gpioB_value = 0x00;                    // NO overfill alarm
+    overfillAlarmActive = false;           // Alarm flag OFF
+    overfillValidationComplete = false;    // Force lockout period
+    overfillStartupTime = 0;
+    overfillLowCount = 0;
+    overfillHighCount = 0;
+    overfillCheckTimer = 0;
+    
+    // Pre-initialize DISP_SHUTDN protection state
+    gpioA_value = 0x10;                    // V6 ON
+    dispShutdownProtectionActive = true;
+    dispShutdownStartupTime = 0;
+    
     // Initialize relay pins to safe states (same as normal mode)
     pinMode(CR0_MOTOR, OUTPUT);
     digitalWrite(CR0_MOTOR, LOW);     // Motor OFF
@@ -3642,6 +3651,21 @@ void setup() {
     preferences.end();
     
     // =====================================================================
+    // CRITICAL: Pre-initialize MCP state to SAFE values before task starts
+    // This prevents any race conditions if I2C is queried early
+    // =====================================================================
+    gpioB_value = 0x00;                    // NO overfill alarm
+    overfillAlarmActive = false;           // Alarm flag OFF
+    overfillValidationComplete = false;    // Force 15-second lockout period
+    overfillStartupTime = 0;
+    overfillLowCount = 0;
+    overfillHighCount = 0;
+    overfillCheckTimer = 0;
+    gpioA_value = 0x10;                    // V6/DISP_SHUTDN ON
+    dispShutdownProtectionActive = true;   // Force 20-second lockout period
+    dispShutdownStartupTime = 0;
+    
+    // =====================================================================
     // CRITICAL: Create mutex and start MCP emulator EARLY
     // =====================================================================
     relayMutex = xSemaphoreCreateMutex();
@@ -3667,7 +3691,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 9.2f                 ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 9.3a                 ║");
     Serial.println("║  MCP23017 Emulation + AJAX Web Interface             ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -3843,7 +3867,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 9.1f initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 9.3a initialization complete!");
     Serial.println("✅ MCP I2C slave running on Core 0 (address 0x20)");
     Serial.println("✅ AJAX web interface active (no refresh flashing)");
     Serial.println("✅ Serial watchdog ready");
