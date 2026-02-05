@@ -1,6 +1,6 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 9.3a
+ *  Walter IO Board Firmware - Rev 9.4
  *  Date: 2/5/2026
  *  Written By: Todd Adams & Doug Harty
  *  
@@ -12,6 +12,18 @@
  *  =====================================================================
  *  REVISION HISTORY
  *  =====================================================================
+ *  
+ *  Rev 9.4 (2/5/2026) - Simplified Diagnostic Dashboard
+ *  - REMOVED: Web relay control (mode buttons, individual relay buttons)
+ *  - REMOVED: Quality Check Test Mode (password section, ADS1015 ADC)
+ *  - REMOVED: Web passthrough toggle (passthrough still works via BlueCherry/serial)
+ *  - REMOVED: Web I2C reset endpoint
+ *  - NEW: Read-only Service Diagnostic Dashboard for field contractors
+ *  - Dashboard shows: Serial data, Cellular modem status, IO board health
+ *  - Displays: RSRP/RSRQ signal quality with visual bar, LTE/BlueCherry status
+ *  - Displays: SD card status, I2C transaction counts, overfill sensor, uptime
+ *  - Relay control now exclusively via I2C from Linux master (no web conflicts)
+ *  - Kept: Device name configuration, watchdog toggle
  *  
  *  Rev 9.3a (2/5/2026) - Critical Safety Fixes
  *  - FIXED: DISP_SHUTDN relay randomly turning off
@@ -142,7 +154,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 9.3a"
+#define VERSION "Rev 9.4"
 String ver = VERSION;
 
 // ### Libraries ###
@@ -159,7 +171,7 @@ String ver = VERSION;
 #include <SPI.h>
 #include <tinycbor.h>
 #include <Wire.h>
-#include <Adafruit_ADS1X15.h>  // ADS1015/ADS1115 ADC library for QC testing
+// Adafruit_ADS1X15 removed in Rev 9.4 - QC mode removed for simplification
 // Web interface HTML is embedded directly below (after web server setup section)
 
 // =====================================================================
@@ -277,9 +289,11 @@ volatile bool i2cDebugEnabled = false;  // Set true to enable verbose I2C loggin
 
 // Thread safety
 SemaphoreHandle_t relayMutex = NULL;
-bool webOverrideActive = false;
+// Web override removed in Rev 9.4 - web interface is now read-only
+// Relay control is exclusively managed by I2C from the Linux master
+bool webOverrideActive = false;       // Kept for compatibility, always false
 unsigned long lastWebActivity = 0;
-const unsigned long WEB_OVERRIDE_TIMEOUT = 5000; // 5 seconds
+const unsigned long WEB_OVERRIDE_TIMEOUT = 5000;
 
 // Current mode tracking
 RunMode current_mode = IDLE_MODE;
@@ -433,11 +447,8 @@ void enterPassthroughMode(unsigned long timeoutMinutes = 60);
 void exitPassthroughMode();
 void runPassthroughLoop();
 
-// Quality Check Test Mode - uses ADS1015 ADC for testing when I2C master not connected
-// NOTE: QC mode temporarily takes over I2C bus for ADC readings
-bool qcModeActive = false;         // True when QC test mode is active
-Adafruit_ADS1015 ads1015;          // ADS1015 12-bit ADC at default address 0x48
-bool ads1015Available = false;     // True if ADS1015 detected on I2C bus
+// QC mode removed in Rev 9.4 - web interface is now read-only diagnostic dashboard
+// Relay control is exclusively managed by I2C from the Linux master
 
 uint8_t dataBuf[8] = { 0 };
 uint8_t incomingBuf[256] = { 0 };
@@ -1326,236 +1337,155 @@ const char* control_html = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Walter IO Board - Rev 9.3a</title>
+    <title>Walter IO Board - Rev 9.4</title>
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 20px auto;
-            padding: 20px;
-            background-color: #f0f0f0;
-        }
-        .panel {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-        }
-        h1 { color: #333; text-align: center; }
-        .subtitle { text-align: center; color: #666; margin-top: -10px; margin-bottom: 20px; }
-        .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 20px 0; }
-        .status-item { padding: 10px; background: #f8f8f8; border-radius: 5px; }
-        .status-label { font-weight: bold; color: #666; }
-        .status-value { font-size: 1.2em; color: #333; transition: background-color 0.3s ease; }
-        .status-value.updated { background-color: #e8f5e9; }
-        .relay-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 20px 0; }
-        .relay-btn { padding: 15px; font-size: 16px; border: 2px solid #ddd; border-radius: 5px; cursor: pointer; transition: all 0.3s; background-color: #fff; }
-        .relay-btn.active { background-color: #4CAF50; color: white; border-color: #4CAF50; }
-        .mode-btn { padding: 15px 30px; font-size: 18px; margin: 5px; border: none; border-radius: 5px; cursor: pointer; background-color: #2196F3; color: white; transition: all 0.3s; }
-        .mode-btn:hover { background-color: #1976D2; }
-        .mode-btn.active { background-color: #4CAF50; }
-        .alarm { color: #f44336; font-weight: bold; }
-        .normal { color: #4CAF50; }
-        .connection-status { position: fixed; top: 10px; right: 10px; padding: 5px 10px; border-radius: 5px; font-size: 12px; z-index: 1000; }
-        .connection-status.connected { background-color: #4CAF50; color: white; }
-        .connection-status.disconnected { background-color: #f44336; color: white; }
-        .last-update { text-align: center; font-size: 11px; color: #999; margin-top: 10px; }
-        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center; }
-        .modal-overlay.show { display: flex; }
-        .modal-dialog { background: white; border-radius: 8px; max-width: 90%; width: 400px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); overflow: hidden; }
-        .modal-header { background: #ff5722; color: white; padding: 15px 20px; font-weight: bold; font-size: 1.1em; }
-        .modal-body { padding: 20px; color: #333; line-height: 1.6; }
-        .modal-footer { padding: 15px 20px; background: #f5f5f5; display: flex; justify-content: flex-end; gap: 10px; }
-        .modal-btn { padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 1em; }
-        .modal-btn-cancel { background: #9e9e9e; color: white; }
-        .modal-btn-confirm { background: #f44336; color: white; }
-        .qc-section { display: none !important; visibility: hidden; margin-top: 20px; padding: 20px; background: linear-gradient(135deg, #1a237e 0%, #283593 100%); border-radius: 10px; border: 3px solid #ffeb3b; }
-        .qc-section.unlocked { display: block !important; visibility: visible !important; }
-        .qc-header { color: #ffeb3b; font-size: 1.3em; font-weight: bold; margin-bottom: 15px; text-align: center; text-transform: uppercase; letter-spacing: 2px; }
-        .qc-unlock-btn { display: block; width: 100%; padding: 15px; margin-top: 20px; background: linear-gradient(135deg, #5d4037 0%, #4e342e 100%); color: #ffcc80; border: 2px solid #8d6e63; border-radius: 8px; cursor: pointer; font-size: 1em; font-weight: bold; transition: all 0.3s ease; }
-        .qc-unlock-btn:hover { background: linear-gradient(135deg, #6d4c41 0%, #5d4037 100%); border-color: #a1887f; }
-        .qc-unlock-btn.hidden { display: none; }
-        .qc-controls { display: grid; gap: 15px; }
-        .qc-control-group { background: rgba(255,255,255,0.1); padding: 15px; border-radius: 8px; }
-        .qc-control-label { color: #b3e5fc; font-weight: bold; margin-bottom: 10px; font-size: 1.1em; }
-        .qc-relay-btn { padding: 12px 20px; margin: 5px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; min-width: 80px; transition: all 0.2s ease; }
-        .qc-relay-btn.off { background: #424242; color: #9e9e9e; }
-        .qc-relay-btn.on { background: #4CAF50; color: white; box-shadow: 0 0 10px rgba(76, 175, 80, 0.5); }
-        .qc-mode-btn { padding: 10px 15px; margin: 3px; border: 2px solid #64b5f6; border-radius: 6px; background: transparent; color: #64b5f6; cursor: pointer; font-weight: bold; transition: all 0.2s ease; }
-        .qc-mode-btn.active { background: #2196F3; color: white; border-color: #2196F3; }
-        .qc-lock-btn { margin-top: 15px; padding: 10px 20px; background: #f44336; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 15px; background: #f0f2f5; }
+        .hdr { text-align: center; padding: 15px 0; }
+        .hdr h1 { margin: 0; font-size: 1.4em; color: #1a1a2e; }
+        .hdr p { margin: 4px 0 0; color: #666; font-size: 0.85em; }
+        .badge { position: fixed; top: 8px; right: 8px; padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; z-index: 100; }
+        .badge.ok { background: #4CAF50; color: #fff; }
+        .badge.err { background: #f44336; color: #fff; }
+        .card { background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 12px; overflow: hidden; }
+        .card-title { font-size: 0.9em; font-weight: 700; color: #fff; padding: 8px 14px; margin: 0; }
+        .card-body { padding: 10px 14px; }
+        .bg-blue { background: #1565c0; }
+        .bg-green { background: #2e7d32; }
+        .bg-gray { background: #455a64; }
+        .bg-orange { background: #e65100; }
+        .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #f0f0f0; }
+        .row:last-child { border-bottom: none; }
+        .lbl { color: #777; font-size: 0.85em; }
+        .val { font-weight: 600; font-size: 0.95em; color: #222; text-align: right; transition: background 0.3s; }
+        .val.flash { background: #e8f5e9; border-radius: 3px; }
+        .ok-text { color: #2e7d32; }
+        .warn-text { color: #e65100; }
+        .err-text { color: #c62828; font-weight: bold; }
+        .signal-bar { display: inline-block; width: 60px; height: 10px; background: #e0e0e0; border-radius: 5px; overflow: hidden; vertical-align: middle; margin-left: 6px; }
+        .signal-fill { height: 100%; border-radius: 5px; transition: width 0.5s; }
+        .cfg-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; }
+        .cfg-row input[type=text] { padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; width: 140px; }
+        .btn { padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 0.85em; color: #fff; }
+        .btn-green { background: #4CAF50; }
+        .btn-green:active { background: #388E3C; }
+        .ts { text-align: center; font-size: 0.7em; color: #aaa; padding: 6px; }
     </style>
 </head>
 <body>
-    <div id="passthroughModal" class="modal-overlay">
-        <div class="modal-dialog">
-            <div class="modal-header">Warning: Enter Passthrough Mode?</div>
-            <div class="modal-body">
-                <p><strong>This will:</strong></p>
-                <ul style="margin: 10px 0; padding-left: 20px;">
-                    <li>Suspend normal firmware operations</li>
-                    <li>Bridge RS-232 serial directly to modem</li>
-                    <li>Allow AT commands and PPP connections</li>
-                </ul>
-                <p style="margin-top: 15px; color: #c62828;"><strong>Reboot the device to return to normal operation.</strong></p>
-            </div>
-            <div class="modal-footer">
-                <button type="button" class="modal-btn modal-btn-cancel" onclick="cancelPassthrough()">Cancel</button>
-                <button type="button" class="modal-btn modal-btn-confirm" onclick="confirmPassthrough()">Enable Passthrough</button>
-            </div>
+    <div class="badge ok" id="connBadge">Connected</div>
+    <div class="hdr">
+        <h1>Walter IO Board</h1>
+        <p>Service Diagnostic Dashboard - Rev 9.4</p>
+    </div>
+    <div class="card">
+        <div class="card-title bg-blue">Serial Data (from Linux Device)</div>
+        <div class="card-body">
+            <div class="row"><span class="lbl">Serial Status</span><span class="val" id="serialStatus">--</span></div>
+            <div class="row"><span class="lbl">Device ID</span><span class="val" id="deviceId">--</span></div>
+            <div class="row"><span class="lbl">Pressure (IWC)</span><span class="val" id="pressure">--</span></div>
+            <div class="row"><span class="lbl">Current (Amps)</span><span class="val" id="current">--</span></div>
+            <div class="row"><span class="lbl">Operating Mode</span><span class="val" id="mode">--</span></div>
+            <div class="row"><span class="lbl">Run Cycles</span><span class="val" id="cycles">--</span></div>
+            <div class="row"><span class="lbl">Fault Code</span><span class="val" id="fault">--</span></div>
         </div>
     </div>
-    <div id="qcPasswordModal" class="modal-overlay">
-        <div class="modal-dialog">
-            <div class="modal-header" style="background: #5d4037;">Quality Check Test</div>
-            <div class="modal-body">
-                <p><strong>Enter password to access QC Test Mode:</strong></p>
-                <input type="password" id="qcPasswordInput" style="width: 100%; padding: 12px; margin: 15px 0; font-size: 1.2em; border: 2px solid #ccc; border-radius: 6px; text-align: center;" placeholder="Enter password" onkeypress="if(event.key==='Enter')submitQCPassword()">
-                <p id="qcPasswordError" style="color: #f44336; display: none; margin-top: 10px;">Incorrect password</p>
-            </div>
-            <div class="modal-footer">
-                <button type="button" class="modal-btn modal-btn-cancel" onclick="cancelQCPassword()">Cancel</button>
-                <button type="button" class="modal-btn modal-btn-confirm" style="background: #5d4037;" onclick="submitQCPassword()">Unlock</button>
-            </div>
+    <div class="card">
+        <div class="card-title bg-green">Cellular Modem</div>
+        <div class="card-body">
+            <div class="row"><span class="lbl">LTE Status</span><span class="val" id="lteStatus">--</span></div>
+            <div class="row"><span class="lbl">RSRP (Signal Strength)</span><span class="val" id="rsrp">--</span></div>
+            <div class="row"><span class="lbl">RSRQ (Signal Quality)</span><span class="val" id="rsrq">--</span></div>
+            <div class="row"><span class="lbl">Signal Level</span><span class="val" id="signalLevel">--<div class="signal-bar"><div class="signal-fill" id="signalBar" style="width:0%;background:#ccc;"></div></div></span></div>
+            <div class="row"><span class="lbl">Operator</span><span class="val" id="operator">--</span></div>
+            <div class="row"><span class="lbl">Band</span><span class="val" id="band">--</span></div>
+            <div class="row"><span class="lbl">BlueCherry Cloud</span><span class="val" id="blueCherry">--</span></div>
         </div>
     </div>
-    <div class="connection-status connected" id="connectionStatus">Connected</div>
-    <h1>Walter IO Board Firmware</h1>
-    <p class="subtitle">Rev 9.3a Control Panel</p>
-    <div class="panel">
-        <h2>System Status</h2>
-        <div class="status-grid">
-            <div class="status-item"><div class="status-label">Pressure (IWC)</div><div class="status-value" id="pressure">%PRESSURE%</div></div>
-            <div class="status-item"><div class="status-label">Current (Amps)</div><div class="status-value" id="current">%CURRENT%</div></div>
-            <div class="status-item"><div class="status-label">Temperature (F)</div><div class="status-value" id="temperature">%TEMPERATURE%</div></div>
-            <div class="status-item"><div class="status-label">Run Cycles</div><div class="status-value" id="cycles">%CYCLES%</div></div>
-            <div class="status-item"><div class="status-label">Mode</div><div class="status-value" id="mode">%MODE%</div></div>
-            <div class="status-item"><div class="status-label">Overfill Status</div><div class="status-value" id="overfill">%OVERFILL%</div></div>
+    <div class="card">
+        <div class="card-title bg-gray">IO Board Status</div>
+        <div class="card-body">
+            <div class="row"><span class="lbl">Firmware Version</span><span class="val" id="version">--</span></div>
+            <div class="row"><span class="lbl">Board Temperature</span><span class="val" id="temperature">--</span></div>
+            <div class="row"><span class="lbl">SD Card</span><span class="val" id="sdCard">--</span></div>
+            <div class="row"><span class="lbl">Overfill Sensor</span><span class="val" id="overfill">--</span></div>
+            <div class="row"><span class="lbl">I2C Transactions</span><span class="val" id="i2cTx">--</span></div>
+            <div class="row"><span class="lbl">I2C Errors</span><span class="val" id="i2cErr">--</span></div>
+            <div class="row"><span class="lbl">Watchdog</span><span class="val" id="watchdog">--</span></div>
+            <div class="row"><span class="lbl">Uptime</span><span class="val" id="uptime">--</span></div>
+            <div class="row"><span class="lbl">MAC Address</span><span class="val" id="mac">--</span></div>
         </div>
-        <div class="last-update" id="lastUpdate">Last update: --</div>
     </div>
-    <div class="panel">
-        <h2>Device Info</h2>
-        <div class="status-item"><div class="status-label">Device Name</div><div class="status-value" id="deviceName">%DEVICENAME%</div></div>
-        <div class="status-item"><div class="status-label">MAC Address</div><div class="status-value" id="macAddress">%MACADDRESS%</div></div>
-        <div class="status-item"><div class="status-label">Firmware Version</div><div class="status-value" id="version">%VERSION%</div></div>
-        <div class="status-item"><div class="status-label">OTA Platform (BlueCherry)</div><div class="status-value" id="blueCherryStatus">%BLUECHERRY%</div></div>
-        <div class="status-item"><div class="status-label">System Uptime</div><div class="status-value" id="uptime">%UPTIME%</div></div>
-    </div>
-    <div class="panel">
-        <h2>Configuration</h2>
-        <div class="status-item">
-            <div class="status-label">Device Name / ID</div>
-            <div class="status-value" style="display: flex; align-items: center; gap: 10px;">
-                <input type="text" id="deviceNameInput" placeholder="e.g., RND-0007" style="padding: 8px; border: 1px solid #ccc; border-radius: 4px; width: 150px; font-size: 14px;" maxlength="20" value="%DEVICENAME%">
-                <button onclick="setDeviceName()" style="padding: 8px 16px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">Set Name</button>
-                <span id="nameStatus" style="font-size: 12px; color: #666;"></span>
+    <div class="card">
+        <div class="card-title bg-orange">Configuration</div>
+        <div class="card-body">
+            <div class="cfg-row">
+                <span class="lbl">Device Name:</span>
+                <input type="text" id="nameInput" maxlength="20" value="%DEVICENAME%">
+                <button class="btn btn-green" onclick="saveName()">Save</button>
+                <span id="nameMsg" style="font-size:11px;"></span>
             </div>
-        </div>
-        <div class="status-item" style="background: #e3f2fd; border-left: 4px solid #2196F3; padding: 10px; margin-top: 5px; margin-bottom: 15px;">
-            <div style="font-size: 0.9em; color: #1565C0;"><strong>Device Name Info:</strong> This name is used for the WiFi AP name and data identification.</div>
-        </div>
-        <div class="status-item">
-            <div class="status-label">Enable Serial Watchdog Function</div>
-            <div class="status-value">
-                <label style="display: flex; align-items: center; cursor: pointer;">
-                    <input type="checkbox" id="watchdogToggle" onchange="toggleWatchdog(this.checked)" %WATCHDOG_CHECKED% style="width: 24px; height: 24px; margin-right: 10px; cursor: pointer;">
-                    <span id="watchdogStatus" style="font-weight: bold;">%WATCHDOG_STATUS%</span>
+            <div style="font-size:0.75em;color:#999;padding:2px 0 6px;">Used for WiFi AP name and data identification</div>
+            <div class="cfg-row">
+                <span class="lbl">Serial Watchdog:</span>
+                <label style="display:flex;align-items:center;cursor:pointer;">
+                    <input type="checkbox" id="wdToggle" onchange="setWatchdog(this.checked)" style="width:20px;height:20px;margin-right:6px;">
+                    <span id="wdLabel" style="font-weight:600;font-size:0.85em;">--</span>
                 </label>
             </div>
-        </div>
-        <div class="status-item" style="background: #fff3cd; border-left: 4px solid #ffc107; padding: 10px; margin-top: 10px;">
-            <div style="font-size: 0.9em; color: #856404;"><strong>Watchdog Info:</strong> When enabled, if no serial data is received for 30 minutes, GPIO39 pulses to reset external device.</div>
-        </div>
-        <div class="status-item" style="margin-top: 20px; padding-top: 15px; border-top: 2px solid #ddd;">
-            <div class="status-label">Modem Passthrough Mode</div>
-            <div class="status-value" style="display: flex; align-items: center; gap: 10px;">
-                <button type="button" id="passthroughBtn" onclick="togglePassthrough(event)" style="padding: 10px 20px; background: #ff5722; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Enter Passthrough Mode</button>
-                <span id="passthroughStatus" style="font-weight: bold; color: #666;">Inactive</span>
-            </div>
-        </div>
-        <div class="status-item" style="background: #ffebee; border-left: 4px solid #f44336; padding: 10px; margin-top: 5px;">
-            <div style="font-size: 0.9em; color: #c62828;"><strong>Warning:</strong> Passthrough bridges RS-232 to modem. Reboot to exit.</div>
-        </div>
-        <button type="button" id="qcUnlockBtn" class="qc-unlock-btn" onclick="promptQCPassword()">Quality Check Test (Authorized Personnel Only)</button>
-        <div id="qcSection" class="qc-section" style="display:none !important;">
-            <div class="qc-header">Quality Check Test Mode</div>
-            <div style="color: #ffcdd2; font-size: 0.85em; text-align: center; margin-bottom: 15px;">I2C Master device should NOT be connected during QC testing</div>
-            <div class="qc-controls">
-                <div class="qc-control-group">
-                    <div class="qc-control-label">Quick Mode Control</div>
-                    <div id="qcModeButtons">
-                        <button type="button" class="qc-mode-btn" onclick="qcSetMode(0)">IDLE</button>
-                        <button type="button" class="qc-mode-btn" onclick="qcSetMode(1)">RUN</button>
-                        <button type="button" class="qc-mode-btn" onclick="qcSetMode(2)">PURGE</button>
-                        <button type="button" class="qc-mode-btn" onclick="qcSetMode(3)">BURP</button>
-                    </div>
-                    <div style="color: #b0bec5; font-size: 0.85em; margin-top: 8px;">Current Mode: <span id="qcCurrentMode" style="color: #ffeb3b; font-weight: bold;">0</span></div>
-                </div>
-                <div class="qc-control-group">
-                    <div class="qc-control-label">Individual Relay Control</div>
-                    <div id="qcRelayButtons">
-                        <button type="button" id="qcRelay0" class="qc-relay-btn off" onclick="qcToggleRelay(0)">Motor</button>
-                        <button type="button" id="qcRelay1" class="qc-relay-btn off" onclick="qcToggleRelay(1)">CR1</button>
-                        <button type="button" id="qcRelay2" class="qc-relay-btn off" onclick="qcToggleRelay(2)">CR2</button>
-                        <button type="button" id="qcRelay3" class="qc-relay-btn off" onclick="qcToggleRelay(3)">CR5</button>
-                        <button type="button" id="qcRelay4" class="qc-relay-btn off" onclick="qcToggleRelay(4)">V6</button>
-                    </div>
-                    <div style="color: #b0bec5; font-size: 0.85em; margin-top: 8px;">Relay State: <span id="qcRelayMask" style="color: #ffeb3b; font-family: monospace;">0x00</span></div>
-                </div>
-                <div class="qc-control-group">
-                    <div class="qc-control-label">ADC Readings (ADS1015)</div>
-                    <div style="color: #e0e0e0; font-size: 0.9em; line-height: 1.8;">
-                        <div>AIN0 (Single): <span id="qcAIN0" style="color: #4fc3f7; font-family: monospace;">-- mV</span></div>
-                        <div>AIN2/3 (Diff): <span id="qcDiff23" style="color: #4fc3f7; font-family: monospace;">-- mV</span></div>
-                        <div>ADC Status: <span id="qcADCStatus" style="color: #ffeb3b;">Not initialized</span></div>
-                    </div>
-                    <button type="button" onclick="refreshADCReadings()" style="margin-top: 10px; padding: 8px 15px; background: #00897b; color: white; border: none; border-radius: 4px; cursor: pointer;">Refresh ADC</button>
-                </div>
-                <div class="qc-control-group">
-                    <div class="qc-control-label">Live Status</div>
-                    <div style="color: #e0e0e0; font-size: 0.9em; line-height: 1.8;">
-                        <div>Pressure: <span id="qcPressure" style="color: #4fc3f7;">--</span></div>
-                        <div>Current: <span id="qcCurrent" style="color: #4fc3f7;">--</span></div>
-                        <div>Temperature: <span id="qcTemperature" style="color: #4fc3f7;">--</span></div>
-                        <div>Overfill: <span id="qcOverfill" style="color: #4fc3f7;">--</span></div>
-                    </div>
-                </div>
-            </div>
-            <button type="button" class="qc-lock-btn" onclick="lockQCSection()">Lock QC Section</button>
+            <div style="font-size:0.75em;color:#999;padding:2px 0;">Pulses GPIO39 if no serial data for 30 min</div>
         </div>
     </div>
+    <div class="ts" id="lastUpdate">Waiting for data...</div>
     <script>
-        let relayState = 0, currentModeIndex = 0, isPassthroughActive = false, passthroughPending = false, connectionErrors = 0;
-        const MAX_ERRORS = 3;
-        let qcUnlocked = false;
-        const QC_PASSWORD = '1793';
-        document.addEventListener('DOMContentLoaded', function() { if (document.activeElement) document.activeElement.blur(); });
-        let qcRelayState = 0, qcModeIndex = 0;
-        function promptQCPassword() { document.getElementById('qcPasswordModal').classList.add('show'); document.getElementById('qcPasswordInput').value = ''; document.getElementById('qcPasswordError').style.display = 'none'; setTimeout(() => document.getElementById('qcPasswordInput').focus(), 100); }
-        function cancelQCPassword() { document.getElementById('qcPasswordModal').classList.remove('show'); }
-        function submitQCPassword() { if (document.getElementById('qcPasswordInput').value === QC_PASSWORD) { document.getElementById('qcPasswordModal').classList.remove('show'); unlockQCSection(); } else { document.getElementById('qcPasswordError').style.display = 'block'; document.getElementById('qcPasswordInput').value = ''; } }
-        function unlockQCSection() { fetch('/setqcmode?enabled=1').then(r => r.text()).then(d => { qcUnlocked = true; document.getElementById('qcSection').style.display = 'block'; document.getElementById('qcSection').classList.add('unlocked'); document.getElementById('qcUnlockBtn').classList.add('hidden'); document.getElementById('qcADCStatus').textContent = d.includes('FOUND') ? 'Ready' : 'ADC Not Found'; document.getElementById('qcADCStatus').style.color = d.includes('FOUND') ? '#4CAF50' : '#f44336'; if(d.includes('FOUND')) refreshADCReadings(); updateQCDisplay(); }); }
-        function lockQCSection() { fetch('/setqcmode?enabled=0'); qcUnlocked = false; document.getElementById('qcSection').style.display = 'none'; document.getElementById('qcSection').classList.remove('unlocked'); document.getElementById('qcUnlockBtn').classList.remove('hidden'); }
-        function refreshADCReadings() { fetch('/qcadc').then(r => r.json()).then(d => { if (d.error) { document.getElementById('qcAIN0').textContent = 'Error'; document.getElementById('qcDiff23').textContent = 'Error'; } else { document.getElementById('qcAIN0').textContent = d.ain0_mV.toFixed(1) + ' mV'; document.getElementById('qcDiff23').textContent = d.diff23_mV.toFixed(1) + ' mV'; } }); }
-        function qcSetMode(m) { fetch('/setmode?mode=' + m).then(() => { qcModeIndex = m; updateQCModeButtons(); }); }
-        function qcToggleRelay(r) { qcRelayState ^= (1 << r); fetch('/setrelays?mask=' + qcRelayState).then(() => updateQCRelayButtons()); }
-        function updateQCModeButtons() { document.querySelectorAll('#qcModeButtons .qc-mode-btn').forEach((b, i) => b.classList.toggle('active', i === qcModeIndex)); document.getElementById('qcCurrentMode').textContent = qcModeIndex; }
-        function updateQCRelayButtons() { ['qcRelay0','qcRelay1','qcRelay2','qcRelay3','qcRelay4'].forEach((n, i) => { const b = document.getElementById(n); b.classList.toggle('on', (qcRelayState & (1 << i)) !== 0); b.classList.toggle('off', (qcRelayState & (1 << i)) === 0); }); document.getElementById('qcRelayMask').textContent = '0x' + qcRelayState.toString(16).toUpperCase().padStart(2, '0'); }
-        function updateQCDisplay() { const p = document.getElementById('pressure'), c = document.getElementById('current'), t = document.getElementById('temperature'), o = document.getElementById('overfill'); if (p) document.getElementById('qcPressure').textContent = p.textContent; if (c) document.getElementById('qcCurrent').textContent = c.textContent; if (t) document.getElementById('qcTemperature').textContent = t.textContent; if (o) document.getElementById('qcOverfill').textContent = o.textContent; qcModeIndex = currentModeIndex; qcRelayState = relayState; updateQCModeButtons(); updateQCRelayButtons(); }
-        function flashUpdate(id) { const el = document.getElementById(id); if (el) { el.classList.add('updated'); setTimeout(() => el.classList.remove('updated'), 500); } }
-        function setConnectionStatus(c) { const s = document.getElementById('connectionStatus'); s.textContent = c ? 'Connected' : 'Disconnected'; s.className = 'connection-status ' + (c ? 'connected' : 'disconnected'); if (c) connectionErrors = 0; }
-        function fetchStatusData() { fetch('/api/status').then(r => { if (!r.ok) throw new Error('Network error'); return r.json(); }).then(d => { setConnectionStatus(true); ['pressure','current','temperature','cycles','mode'].forEach(f => { const el = document.getElementById(f); if (el && el.textContent !== String(d[f])) { el.textContent = d[f]; flashUpdate(f); } }); const ov = document.getElementById('overfill'); if (ov) { ov.textContent = d.overfill; ov.className = 'status-value ' + (d.overfillAlarm ? 'alarm' : 'normal'); } relayState = d.relayState || 0; currentModeIndex = d.modeIndex || 0; const wt = document.getElementById('watchdogToggle'), ws = document.getElementById('watchdogStatus'); if (wt && d.watchdogEnabled !== undefined) { wt.checked = d.watchdogEnabled; if (ws) { ws.textContent = d.watchdogEnabled ? 'ENABLED' : 'DISABLED'; ws.style.color = d.watchdogEnabled ? '#4CAF50' : '#666'; } } const bc = document.getElementById('blueCherryStatus'); if (bc && d.blueCherryConnected !== undefined) bc.innerHTML = d.blueCherryConnected ? '<span style="color:#4CAF50">Connected</span>' : '<span style="color:#f44336">Offline</span>'; const up = document.getElementById('uptime'); if (up && d.uptimeHours !== undefined) up.textContent = d.uptimeHours + 'h'; if (d.passthroughActive !== undefined && !passthroughPending) { const btn = document.getElementById('passthroughBtn'), st = document.getElementById('passthroughStatus'); if (btn && st) { isPassthroughActive = d.passthroughActive; btn.textContent = d.passthroughActive ? 'Exit Passthrough Mode' : 'Enter Passthrough Mode'; btn.style.background = d.passthroughActive ? '#4CAF50' : '#ff5722'; st.textContent = d.passthroughActive ? 'ACTIVE' : 'Inactive'; st.style.color = d.passthroughActive ? '#f44336' : '#666'; } } if (qcUnlocked) updateQCDisplay(); document.getElementById('lastUpdate').textContent = 'Last update: ' + new Date().toLocaleTimeString(); }).catch(e => { connectionErrors++; if (connectionErrors >= MAX_ERRORS) setConnectionStatus(false); }); }
-        function toggleWatchdog(e) { fetch('/setwatchdog?enabled=' + (e ? '1' : '0')).then(() => { document.getElementById('watchdogStatus').textContent = e ? 'ENABLED' : 'DISABLED'; document.getElementById('watchdogStatus').style.color = e ? '#4CAF50' : '#666'; }); }
-        function togglePassthrough(e) { if (e) { e.preventDefault(); e.stopPropagation(); } if (!isPassthroughActive) document.getElementById('passthroughModal').classList.add('show'); else executePassthroughDisable(); }
-        function cancelPassthrough() { document.getElementById('passthroughModal').classList.remove('show'); }
-        function confirmPassthrough() { document.getElementById('passthroughModal').classList.remove('show'); executePassthroughEnable(); }
-        function executePassthroughEnable() { const btn = document.getElementById('passthroughBtn'), st = document.getElementById('passthroughStatus'); st.textContent = 'Activating...'; passthroughPending = true; fetch('/setpassthrough?enabled=1').then(r => r.text()).then(() => { isPassthroughActive = true; btn.textContent = 'Exit Passthrough Mode'; btn.style.background = '#4CAF50'; st.textContent = 'ACTIVE'; st.style.color = '#f44336'; passthroughPending = false; }); }
-        function executePassthroughDisable() { const btn = document.getElementById('passthroughBtn'), st = document.getElementById('passthroughStatus'); st.textContent = 'Deactivating...'; passthroughPending = true; fetch('/setpassthrough?enabled=0').then(r => r.text()).then(() => { isPassthroughActive = false; btn.textContent = 'Enter Passthrough Mode'; btn.style.background = '#ff5722'; st.textContent = 'Inactive'; st.style.color = '#666'; passthroughPending = false; }); }
-        function setDeviceName() { const n = document.getElementById('deviceNameInput').value.trim(), s = document.getElementById('nameStatus'); if (n.length < 3 || n.length > 20) { s.textContent = 'Name must be 3-20 chars'; s.style.color = '#f44336'; return; } s.textContent = 'Saving...'; fetch('/setdevicename?name=' + encodeURIComponent(n)).then(r => r.text()).then(() => { s.textContent = 'Saved!'; s.style.color = '#4CAF50'; const dn = document.getElementById('deviceName'); if (dn) dn.textContent = n; setTimeout(() => s.textContent = '', 3000); }); }
-        fetchStatusData();
-        setInterval(fetchStatusData, 2000);
+        let errs=0;
+        function flash(id){const e=document.getElementById(id);if(e){e.classList.add('flash');setTimeout(()=>e.classList.remove('flash'),500);}}
+        function upd(id,v){const e=document.getElementById(id);if(e&&e.textContent!==String(v)){e.textContent=v;flash(id);}}
+        function conn(ok){const b=document.getElementById('connBadge');b.textContent=ok?'Connected':'Disconnected';b.className='badge '+(ok?'ok':'err');if(ok)errs=0;}
+        function signalColor(rsrp){const v=parseFloat(rsrp);if(isNaN(v))return{pct:0,clr:'#ccc',txt:'--'};if(v>=-80)return{pct:100,clr:'#4CAF50',txt:'Excellent'};if(v>=-90)return{pct:75,clr:'#8BC34A',txt:'Good'};if(v>=-100)return{pct:50,clr:'#FF9800',txt:'Fair'};return{pct:25,clr:'#f44336',txt:'Poor'};}
+        function poll(){fetch('/api/status').then(r=>{if(!r.ok)throw 0;return r.json();}).then(d=>{
+            conn(true);
+            // Serial data
+            const ss=document.getElementById('serialStatus');
+            if(d.serialActive){ss.textContent='Receiving Data';ss.className='val ok-text';}
+            else{ss.textContent='No Data';ss.className='val err-text';}
+            upd('deviceId',d.deviceName||'--');
+            upd('pressure',d.pressure);upd('current',d.current);upd('mode',d.mode);
+            upd('cycles',d.cycles);
+            const fe=document.getElementById('fault');if(fe){fe.textContent=d.fault||'0';fe.className='val'+(parseInt(d.fault)>0?' warn-text':'');}
+            // Modem
+            const le=document.getElementById('lteStatus');
+            if(d.lteConnected){le.innerHTML='<span class="ok-text">Connected</span>';}else{le.innerHTML='<span class="err-text">Disconnected</span>';}
+            upd('rsrp',d.rsrp+' dBm');upd('rsrq',d.rsrq+' dB');
+            const s=signalColor(d.rsrp);upd('signalLevel',s.txt);
+            const bar=document.getElementById('signalBar');if(bar){bar.style.width=s.pct+'%';bar.style.background=s.clr;}
+            upd('operator',d.operator||'--');upd('band',d.band||'--');
+            const bc=document.getElementById('blueCherry');
+            if(d.blueCherryConnected){bc.innerHTML='<span class="ok-text">Connected</span>';}else{bc.innerHTML='<span class="warn-text">Offline</span>';}
+            // IO Board
+            upd('version',d.version);upd('temperature',d.temperature+' F');
+            const sd=document.getElementById('sdCard');
+            if(d.sdCardOK){sd.innerHTML='<span class="ok-text">OK</span>';}else{sd.innerHTML='<span class="err-text">FAULT</span>';}
+            const ov=document.getElementById('overfill');
+            if(d.overfillAlarm){ov.innerHTML='<span class="err-text">ALARM</span>';}else{ov.innerHTML='<span class="ok-text">Normal</span>';}
+            upd('i2cTx',d.i2cTransactions);upd('i2cErr',d.i2cErrors);
+            upd('watchdog',d.watchdogEnabled?'Enabled':'Disabled');
+            const wt=document.getElementById('wdToggle'),wl=document.getElementById('wdLabel');
+            if(wt){wt.checked=d.watchdogEnabled;}
+            if(wl){wl.textContent=d.watchdogEnabled?'ENABLED':'DISABLED';wl.style.color=d.watchdogEnabled?'#2e7d32':'#999';}
+            upd('uptime',d.uptime);upd('mac',d.macAddress);
+            document.getElementById('lastUpdate').textContent='Last update: '+new Date().toLocaleTimeString();
+        }).catch(()=>{errs++;if(errs>=3)conn(false);});}
+        function saveName(){const n=document.getElementById('nameInput').value.trim(),m=document.getElementById('nameMsg');
+            if(n.length<3||n.length>20){m.textContent='3-20 chars required';m.style.color='#c62828';return;}
+            m.textContent='Saving...';m.style.color='#666';
+            fetch('/setdevicename?name='+encodeURIComponent(n)).then(r=>r.text()).then(()=>{
+                m.textContent='Saved!';m.style.color='#2e7d32';setTimeout(()=>m.textContent='',3000);});}
+        function setWatchdog(on){fetch('/setwatchdog?enabled='+(on?'1':'0')).then(()=>{
+            document.getElementById('wdLabel').textContent=on?'ENABLED':'DISABLED';
+            document.getElementById('wdLabel').style.color=on?'#2e7d32':'#999';});}
+        document.addEventListener('DOMContentLoaded',function(){if(document.activeElement)document.activeElement.blur();});
+        poll();setInterval(poll,2000);
     </script>
 </body>
 </html>
@@ -1568,35 +1498,7 @@ const char* control_html = R"rawliteral(
 // It replaces %VARIABLE% placeholders with actual values
 
 String webProcessor(const String& var) {
-    if (var == "PRESSURE") return String(pressure, 2);
-    if (var == "CURRENT") return String(current, 2);
-    if (var == "TEMPERATURE") {
-        float celsius = temperatureRead();
-        float fahrenheit = (celsius * 9.0 / 5.0) + 32;
-        return String(fahrenheit, 1);
-    }
-    if (var == "CYCLES") return String(cycles);
-    if (var == "MODE") return mode_names[current_mode];
-    if (var == "OVERFILL") return overfillAlarmActive ? "ALARM" : "Normal";
-    if (var == "OVERFILL_CLASS") return overfillAlarmActive ? "alarm" : "normal";
     if (var == "DEVICENAME") return DeviceName;
-    if (var == "MACADDRESS") return macStr;
-    if (var == "VERSION") return ver;
-    if (var == "BLUECHERRY") {
-        if (blueCherryConnected) {
-            return "<span style='color:#4CAF50'>Connected</span>";
-        } else {
-            return "<span style='color:#f44336'>Offline (retry hourly)</span>";
-        }
-    }
-    if (var == "UPTIME") {
-        unsigned long uptimeMs = millis() - systemStartTime;
-        unsigned long hours = uptimeMs / 3600000;
-        unsigned long minutes = (uptimeMs % 3600000) / 60000;
-        return String(hours) + "h " + String(minutes) + "m";
-    }
-    if (var == "WATCHDOG_CHECKED") return watchdogEnabled ? "checked" : "";
-    if (var == "WATCHDOG_STATUS") return watchdogEnabled ? "ENABLED" : "DISABLED";
     return "";
 }
 
@@ -1891,44 +1793,9 @@ void startConfigAP() {
         request->send(200, "text/html", "<html><body><h1>Server Working!</h1><p>If you see this, the server is running.</p><p><a href='/'>Go to main page</a></p></body></html>");
     });
     
-    // Main control page
+    // Main diagnostic dashboard page (read-only, no relay control)
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-        webOverrideActive = true;
-        lastWebActivity = millis();
         request->send_P(200, "text/html", control_html, webProcessor);
-    });
-    
-    // Set mode endpoint
-    server.on("/setmode", HTTP_GET, [](AsyncWebServerRequest *request){
-        if (request->hasParam("mode")) {
-            int modeVal = request->getParam("mode")->value().toInt();
-            webOverrideActive = true;
-            lastWebActivity = millis();
-            set_relay_mode((RunMode)modeVal);
-            request->send(200, "text/plain", "Mode set to " + mode_names[modeVal]);
-        } else {
-            request->send(400, "text/plain", "Missing mode parameter");
-        }
-    });
-    
-    // Set individual relays endpoint
-    // CRITICAL: V6 (bit 4, DISP_SHUTDN) can ONLY be turned off via explicit I2C command
-    // Web interface ALWAYS preserves current V6 state for safety
-    server.on("/setrelays", HTTP_GET, [](AsyncWebServerRequest *request){
-        if (request->hasParam("mask")) {
-            uint8_t mask = request->getParam("mask")->value().toInt();
-            webOverrideActive = true;
-            lastWebActivity = millis();
-            
-            // CRITICAL: ALWAYS preserve V6 state - web cannot turn off DISP_SHUTDN
-            // V6 can ONLY be controlled via I2C from the Linux master
-            mask = (mask & 0x0F) | (gpioA_value & 0x10);  // Keep bits 0-3 from request, bit 4 from current
-            
-            setRelayStateSafe(mask);
-            request->send(200, "text/plain", "Relays set to 0x" + String(mask, HEX));
-        } else {
-            request->send(400, "text/plain", "Missing mask parameter");
-        }
     });
     
     // Set watchdog enabled/disabled endpoint
@@ -1994,148 +1861,62 @@ void startConfigAP() {
         }
     });
     
-    // Set passthrough mode endpoint
-    // Usage: GET /setpassthrough?enabled=1 (enter passthrough) or enabled=0 (exit)
-    // Passthrough mode bridges Serial1 (RS-232) to modem for AT commands/PPP
-    // NOTE: Uses preference-based boot - sets flag, restarts, runs minimal passthrough mode
-    // Auto-returns to normal after timeout (default 60 min) or early exit via MCP GPA5
-    server.on("/setpassthrough", HTTP_GET, [](AsyncWebServerRequest *request){
-        if (request->hasParam("enabled")) {
-            int enabledVal = request->getParam("enabled")->value().toInt();
-            
-            if (enabledVal == 1) {
-                // Note: Response sent before restart - user won't see it after restart
-                request->send(200, "text/plain", 
-                    "PASSTHROUGH MODE REQUESTED\n"
-                    "ESP32 will restart in minimal passthrough mode.\n"
-                    "Serial1 (RS-232) will be bridged directly to modem.\n"
-                    "I2C emulator will remain active.\n"
-                    "No WiFi/web server during passthrough.\n"
-                    "Early exit: Set MCP GPA5 via I2C, or wait for timeout (60 min).\n"
-                    "Restarting in 2 seconds...");
-                delay(500);  // Brief delay to send response before restart
-                enterPassthroughMode();  // Sets preferences and restarts
-            } else {
-                // In preference-based approach, this just restarts
-                request->send(200, "text/plain", 
-                    "PASSTHROUGH EXIT REQUESTED\n"
-                    "Restarting ESP32...");
-                delay(500);
-                exitPassthroughMode();
-            }
-        } else {
-            // No parameter - return current status
-            String status = passthroughMode ? "ACTIVE" : "INACTIVE";
-            request->send(200, "text/plain", "Passthrough mode: " + status);
-        }
-    });
-    
-    // Quality Check Test Mode endpoint
-    // Usage: GET /setqcmode?enabled=1 (enter QC mode) or enabled=0 (exit)
-    // QC mode allows ADC readings when I2C master is not connected
-    server.on("/setqcmode", HTTP_GET, [](AsyncWebServerRequest *request){
-        if (request->hasParam("enabled")) {
-            int enabledVal = request->getParam("enabled")->value().toInt();
-            
-            if (enabledVal == 1) {
-                enterQCMode();
-                String response = "QC MODE ENABLED\n";
-                response += ads1015Available ? "ADS1015 ADC: FOUND\n" : "ADS1015 ADC: NOT FOUND\n";
-                request->send(200, "text/plain", response);
-            } else {
-                exitQCMode();
-                request->send(200, "text/plain", "QC MODE DISABLED");
-            }
-        } else {
-            String status = qcModeActive ? "ACTIVE" : "INACTIVE";
-            request->send(200, "text/plain", "QC mode: " + status);
-        }
-    });
-    
-    // QC ADC Reading endpoint - reads ADS1015 channels
-    // Usage: GET /qcadc - returns JSON with all ADC readings
-    // Only works when QC mode is active
-    server.on("/qcadc", HTTP_GET, [](AsyncWebServerRequest *request){
-        if (!qcModeActive) {
-            request->send(400, "application/json", "{\"error\":\"QC mode not active\"}");
-            return;
-        }
-        
-        if (!ads1015Available) {
-            request->send(400, "application/json", "{\"error\":\"ADS1015 not found\"}");
-            return;
-        }
-        
-        // Read all channels
-        float ain0 = readQCADCSingleEnded(0);
-        float ain1 = readQCADCSingleEnded(1);
-        float ain2 = readQCADCSingleEnded(2);
-        float ain3 = readQCADCSingleEnded(3);
-        float diff23 = readQCADCDifferential_2_3();
-        
-        // Build JSON response
-        char jsonBuffer[256];
-        snprintf(jsonBuffer, sizeof(jsonBuffer),
-            "{\"ain0_mV\":%.1f,\"ain1_mV\":%.1f,\"ain2_mV\":%.1f,\"ain3_mV\":%.1f,\"diff23_mV\":%.1f,\"adcOK\":true}",
-            ain0, ain1, ain2, ain3, diff23);
-        
-        request->send(200, "application/json", jsonBuffer);
-    });
-    
-    // I2C Slave Reset endpoint - reinitializes MCP23017 emulation with bus recovery
-    // Usage: GET /i2creset - forces re-initialization of I2C slave
-    // Use this if Linux master loses I2C connection to the emulated MCP23017
-    server.on("/i2creset", HTTP_GET, [](AsyncWebServerRequest *request){
-        Serial.println("\n[I2C] Manual reset requested via web interface");
-        
-        // Full reset with bus recovery
-        resetI2CSlave();
-        
-        String response = "I2C slave reset complete (with bus recovery).\n";
-        response += "Address: 0x20\n";
-        response += "SDA: GPIO " + String(SDA_PIN) + "\n";
-        response += "SCL: GPIO " + String(SCL_PIN) + "\n";
-        response += "Bus recovery performed - stuck SDA cleared if needed\n";
-        response += "Transaction count reset to 0\n";
-        
-        request->send(200, "text/plain", response);
-    });
-    
-    // API endpoint for AJAX status updates (returns JSON, no page refresh needed)
-    // This endpoint provides all dynamic data for the web interface
-    // Usage: GET /api/status returns JSON with pressure, current, temperature, etc.
+    // API endpoint for AJAX status updates (returns JSON for diagnostic dashboard)
+    // READ-ONLY: No relay control, no mode changes - diagnostic data only
+    // Usage: GET /api/status returns JSON with all diagnostic fields
     server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request){
-        webOverrideActive = true;
-        lastWebActivity = millis();
-        
-        // Build JSON response with all status values
-        // Using String concatenation for simplicity (ArduinoJson would be more robust)
         float celsius = temperatureRead();
         float fahrenheit = (celsius * 9.0 / 5.0) + 32;
         
+        // Determine if serial data is actively being received
+        // Consider "active" if data received within last 60 seconds
+        bool serialActive = (millis() - lastSerialDataTime < 60000) && (lastSerialDataTime > 0);
+        
+        // Calculate uptime as human-readable string
+        unsigned long uptimeMs = millis() - systemStartTime;
+        unsigned long days = uptimeMs / 86400000;
+        unsigned long hours = (uptimeMs % 86400000) / 3600000;
+        unsigned long minutes = (uptimeMs % 3600000) / 60000;
+        char uptimeStr[32];
+        if (days > 0) {
+            snprintf(uptimeStr, sizeof(uptimeStr), "%lud %luh %lum", days, hours, minutes);
+        } else {
+            snprintf(uptimeStr, sizeof(uptimeStr), "%luh %lum", hours, minutes);
+        }
+        
+        // Get signal quality strings (updated by syncBlueCherry)
+        String rsrpStr = modemRSRP.length() > 0 ? modemRSRP : "0";
+        String rsrqStr = modemRSRQ.length() > 0 ? modemRSRQ : "0";
+        String operatorStr = modemNetName.length() > 0 ? modemNetName : "Unknown";
+        String bandStr = modemBand.length() > 0 ? modemBand : "--";
+        
+        // Build JSON response with all diagnostic fields
         String json = "{";
+        // Serial data from Linux device
+        json += "\"serialActive\":" + String(serialActive ? "true" : "false") + ",";
+        json += "\"deviceName\":\"" + DeviceName + "\",";
         json += "\"pressure\":\"" + String(pressure, 2) + "\",";
         json += "\"current\":\"" + String(current, 2) + "\",";
-        json += "\"temperature\":\"" + String(fahrenheit, 1) + "\",";
-        json += "\"cycles\":\"" + String(cycles) + "\",";
         json += "\"mode\":\"" + mode_names[current_mode] + "\",";
-        json += "\"modeIndex\":" + String((int)current_mode) + ",";
-        json += "\"overfill\":\"" + String(overfillAlarmActive ? "ALARM" : "Normal") + "\",";
-        json += "\"overfillAlarm\":" + String(overfillAlarmActive ? "true" : "false") + ",";
-        json += "\"relayState\":" + String(getRelayStateSafe()) + ",";
-        json += "\"watchdogEnabled\":" + String(watchdogEnabled ? "true" : "false") + ",";
-        json += "\"deviceName\":\"" + DeviceName + "\",";
-        json += "\"macAddress\":\"" + macStr + "\",";
-        json += "\"version\":\"" + ver + "\",";
+        json += "\"cycles\":\"" + String(cycles) + "\",";
+        json += "\"fault\":\"" + String(getCombinedFaultCode()) + "\",";
+        // Cellular modem
+        json += "\"lteConnected\":" + String(lteConnected() ? "true" : "false") + ",";
+        json += "\"rsrp\":\"" + rsrpStr + "\",";
+        json += "\"rsrq\":\"" + rsrqStr + "\",";
+        json += "\"operator\":\"" + operatorStr + "\",";
+        json += "\"band\":\"" + bandStr + "\",";
         json += "\"blueCherryConnected\":" + String(blueCherryConnected ? "true" : "false") + ",";
-        // Calculate uptime in hours
-        unsigned long uptimeHours = (millis() - systemStartTime) / 3600000;
-        json += "\"uptimeHours\":" + String(uptimeHours) + ",";
-        // I2C/MCP23017 emulator stats
+        // IO Board status
+        json += "\"version\":\"" + ver + "\",";
+        json += "\"temperature\":\"" + String(fahrenheit, 1) + "\",";
+        json += "\"sdCardOK\":" + String(isSDCardOK() ? "true" : "false") + ",";
+        json += "\"overfillAlarm\":" + String(overfillAlarmActive ? "true" : "false") + ",";
         json += "\"i2cTransactions\":" + String(i2cTransactionCount) + ",";
         json += "\"i2cErrors\":" + String(i2cErrorCount) + ",";
-        // Passthrough mode status
-        json += "\"passthroughActive\":" + String(passthroughMode ? "true" : "false");
+        json += "\"watchdogEnabled\":" + String(watchdogEnabled ? "true" : "false") + ",";
+        json += "\"uptime\":\"" + String(uptimeStr) + "\",";
+        json += "\"macAddress\":\"" + macStr + "\"";
         json += "}";
         
         request->send(200, "application/json", json);
@@ -2373,130 +2154,8 @@ void checkAndSendStatusToSerial() {
 // QUALITY CHECK TEST MODE - ADC FUNCTIONS
 // =====================================================================
 
-/**
- * Initialize ADS1015 ADC for Quality Check testing
- * Called when entering QC mode - temporarily uses I2C bus
- * 
- * NOTE: The I2C master (Linux device) should NOT be connected during QC testing
- *       as this would cause bus conflicts.
- * 
- * Returns: true if ADS1015 found and initialized, false otherwise
- */
-bool initQCModeADC() {
-    Serial.println("[QC] Initializing ADS1015 ADC for Quality Check...");
-    
-    // Try to initialize ADS1015 at default address 0x48
-    // Uses the same I2C pins as MCP emulation (SDA=4, SCL=5)
-    if (ads1015.begin(0x48)) {
-        ads1015Available = true;
-        Serial.println("[QC] ✓ ADS1015 ADC found at address 0x48");
-        
-        // Set gain to +/- 4.096V (1 bit = 2mV for ADS1015)
-        ads1015.setGain(GAIN_ONE);
-        
-        return true;
-    } else {
-        ads1015Available = false;
-        Serial.println("[QC] ✗ ADS1015 ADC not found - check wiring");
-        return false;
-    }
-}
-
-/**
- * Read ADS1015 single-ended channel (AIN0, AIN1, AIN2, or AIN3)
- * 
- * @param channel: 0-3 for AIN0-AIN3
- * @return: Voltage in millivolts, or -9999 if error
- * 
- * With GAIN_ONE: Full scale = +/- 4.096V, 1 bit = 2mV (12-bit ADC)
- */
-float readQCADCSingleEnded(uint8_t channel) {
-    if (!ads1015Available || channel > 3) {
-        return -9999.0;
-    }
-    
-    int16_t rawValue = ads1015.readADC_SingleEnded(channel);
-    // ADS1015 with GAIN_ONE: 1 bit = 2mV
-    float voltage_mV = rawValue * 2.0;
-    
-    return voltage_mV;
-}
-
-/**
- * Read ADS1015 differential between AIN2 and AIN3
- * 
- * @return: Differential voltage in millivolts (AIN2 - AIN3), or -9999 if error
- * 
- * Useful for measuring current shunt, bridge sensors, etc.
- */
-float readQCADCDifferential_2_3() {
-    if (!ads1015Available) {
-        return -9999.0;
-    }
-    
-    int16_t rawValue = ads1015.readADC_Differential_2_3();
-    // ADS1015 with GAIN_ONE: 1 bit = 2mV
-    float voltage_mV = rawValue * 2.0;
-    
-    return voltage_mV;
-}
-
-/**
- * Enter Quality Check Test Mode
- * - Initializes ADC for testing
- * - Sets qcModeActive flag
- */
-void enterQCMode() {
-    if (qcModeActive) {
-        Serial.println("[QC] Already in QC test mode");
-        return;
-    }
-    
-    Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  🔧 ENTERING QUALITY CHECK TEST MODE                  ║");
-    Serial.println("╠═══════════════════════════════════════════════════════╣");
-    Serial.println("║  WARNING: I2C master should NOT be connected!         ║");
-    Serial.println("║  ADC readings will use the I2C bus.                   ║");
-    Serial.println("║  V6 relay will remain ON during all QC operations.    ║");
-    Serial.println("╚═══════════════════════════════════════════════════════╝\n");
-    
-    qcModeActive = true;
-    
-    // Ensure V6 is ON when entering QC mode
-    // V6 is ACTIVE HIGH: HIGH = ON, LOW = OFF
-    digitalWrite(DISP_SHUTDN, HIGH);
-    Serial.println("[QC] ✓ V6 relay set to ON (will stay ON during QC testing)");
-    
-    initQCModeADC();
-}
-
-/**
- * Exit Quality Check Test Mode
- * IMPORTANT: Must re-initialize I2C slave after using ADS1015 (which uses I2C master)
- */
-void exitQCMode() {
-    if (!qcModeActive) {
-        Serial.println("[QC] Not in QC test mode");
-        return;
-    }
-    
-    qcModeActive = false;
-    ads1015Available = false;
-    
-    // CRITICAL: Re-initialize I2C as slave for MCP23017 emulation
-    // The ads1015.begin() call reconfigured Wire as I2C master
-    // We must restore slave mode for Linux master communication
-    // Uses full reset with bus recovery to ensure clean state
-    Serial.println("[QC] Restoring I2C slave mode...");
-    Wire.end();
-    delay(50);  // Let bus settle
-    initI2CSlave();  // Full initialization with bus recovery
-    
-    Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  ✅ EXITING QUALITY CHECK TEST MODE                   ║");
-    Serial.println("║  I2C slave mode restored - Linux master can connect   ║");
-    Serial.println("╚═══════════════════════════════════════════════════════╝\n");
-}
+// QC mode and ADS1015 ADC removed in Rev 9.4 (web simplification)
+// Relay control is exclusively handled by I2C from the Linux master
 
 // =====================================================================
 // PASSTHROUGH MODE FUNCTIONS
@@ -3691,8 +3350,8 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 9.3a                 ║");
-    Serial.println("║  MCP23017 Emulation + AJAX Web Interface             ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 9.4                  ║");
+    Serial.println("║  MCP23017 Emulation + Diagnostic Dashboard           ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
     // Initialize watchdog pin
@@ -3867,7 +3526,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 9.3a initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 9.4 initialization complete!");
     Serial.println("✅ MCP I2C slave running on Core 0 (address 0x20)");
     Serial.println("✅ AJAX web interface active (no refresh flashing)");
     Serial.println("✅ Serial watchdog ready");
