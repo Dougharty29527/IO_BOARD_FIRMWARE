@@ -284,6 +284,7 @@ This prevents conflicts between web and I2C control sources.
 
 | Version | Date | Changes |
 |---------|------|---------|
+
 | Rev 9.1d | 1/30/2026 | CRITICAL: Fixed BlueCherry sync failure causing restart loop |
 | Rev 9.1c | 1/30/2026 | CRITICAL: Fixed I2C timeout causing OSError [Errno 5] |
 | Rev 9.1b | 1/29/2026 | Fixed mutex race condition on relay writes, improved overfill hysteresis |

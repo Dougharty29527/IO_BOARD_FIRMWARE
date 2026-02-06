@@ -214,6 +214,10 @@
 #define VERSION "Rev 9.4e"
 String ver = VERSION;
 
+// Password required to change device name or toggle watchdog via web portal
+// Change this to your desired password. Case-sensitive, sent as URL parameter.
+#define CONFIG_PASSWORD "1793"
+
 // ### Libraries ###
 #include <esp_mac.h>
 #include <WiFi.h>
@@ -228,6 +232,7 @@ String ver = VERSION;
 #include <SPI.h>
 #include <tinycbor.h>
 #include <Wire.h>
+#include <Adafruit_NeoPixel.h>    // WS2812B RGB LED control (install via Library Manager)
 // Adafruit_ADS1X15 removed in Rev 9.4 - QC mode removed for simplification
 // Web interface HTML is embedded directly below (after web server setup section)
 
@@ -276,6 +281,12 @@ String ver = VERSION;
 // ESP32 GPIO pin for serial watchdog pulse output
 #define ESP_WATCHDOG_PIN  39   // Pulses HIGH for 1 second when no serial data for 5 minutes
 
+// WS2812B RGB status LED on GPIO9
+// Color meanings: Blue breathing=Idle, Green=Run, Orange=Purge, Yellow=Burp, Red flash=Passthrough
+#define STATUS_LED_PIN    9
+#define STATUS_LED_COUNT  1
+Adafruit_NeoPixel statusLED(STATUS_LED_COUNT, STATUS_LED_PIN, NEO_GRB + NEO_KHZ800);
+
 // Run modes for relay patterns
 enum RunMode {
     IDLE_MODE = 0,
@@ -311,6 +322,9 @@ volatile uint8_t intcapB_value = 0x00;
 volatile uint8_t olatA_value = 0x00;   // Output latch
 volatile uint8_t olatB_value = 0x00;
 volatile uint8_t registerPointer = 0x00;
+volatile bool pendingRelayWrite = false;  // Deferred relay pin write flag
+// Set by I2C callback, processed by task loop. Keeps I2C callbacks fast
+// to avoid clock stretching that blocks other I2C slaves (ADS1015 at 0x48).
 unsigned long overfillCheckTimer = 0;
 uint8_t overfillLowCount = 0;
 bool overfillAlarmActive = false;
@@ -354,7 +368,7 @@ SemaphoreHandle_t relayMutex = NULL;
 RunMode current_mode = IDLE_MODE;
 
 // Serial watchdog variables
-bool watchdogEnabled = false;                    // Watchdog feature enable/disable flag
+bool watchdogEnabled = true;                     // Watchdog feature enable/disable flag (default: enabled)
 unsigned long lastSerialDataTime = 0;            // Timestamp of last received serial data
 bool watchdogTriggered = false;                  // Flag to track if we're in watchdog state (no serial)
 int watchdogRebootAttempts = 0;                  // Counter for reboot attempts (0 = no attempts yet)
@@ -465,6 +479,8 @@ int unsigned noSerialCount = 0;
 static unsigned int noComInterval = 86400000;
 static unsigned int sendInterval;
 static unsigned int parseSDInterval=15000;
+#define STATUS_INTERVAL 86400000       // 24 hours in milliseconds - daily unified status report
+unsigned long lastDailyStatusTime = 0; // Tracks when last daily status was sent to port 5686
 int lastParseTime = 0 ;
 String DeviceName = "";  // Device name (e.g., "RND-0007", "CSX-1234")
 bool firstLostComm = 0;
@@ -515,6 +531,120 @@ float current = -99.8;
 File logFile;
 unsigned long lastFlush = 0;
 const unsigned long FLUSH_INTERVAL = 30 * 1000;
+
+// =====================================================================
+// STATUS LED FUNCTIONS (WS2812B on GPIO9)
+// =====================================================================
+// Controls a single WS2812B RGB LED to indicate current operating mode:
+//   - Mode 0 (Idle):       Blue breathing effect (smooth fade in/out)
+//   - Mode 1 (Run):        Solid green
+//   - Mode 2 (Purge):      Solid orange
+//   - Mode 3 (Burp):       Solid yellow
+//   - Passthrough:          Flashing red (500ms on/500ms off)
+//
+// The LED brightness is kept moderate (max ~80) to avoid being blinding
+// in dark enclosures. The breathing effect uses a sine-wave approximation
+// for a smooth, organic pulse.
+//
+// Usage:
+//   updateStatusLED();              // Call from loop(), uses current_mode
+//   updatePassthroughLED();         // Call from passthrough loop only
+
+// LED brightness cap (0-255) - keep moderate for WS2812B-2020 which is very bright
+#define LED_MAX_BRIGHTNESS 80
+
+/**
+ * Update the status LED based on current operating mode.
+ * Call this periodically from the main loop() - non-blocking, uses millis().
+ * 
+ * Mode 0 (IDLE_MODE):  Blue breathing effect - sine-wave brightness ramp
+ * Mode 1 (RUN_MODE):   Solid green
+ * Mode 2 (PURGE_MODE): Solid orange (R:255 G:80 B:0 scaled)
+ * Mode 3 (BURP_MODE):  Solid yellow (R:255 G:200 B:0 scaled)
+ *
+ * Usage example:
+ *   // In loop():
+ *   updateStatusLED();  // Automatically reads current_mode global
+ */
+void updateStatusLED() {
+    static unsigned long lastLEDUpdate = 0;
+    unsigned long now = millis();
+    
+    // Update LED every 20ms (~50 fps) for smooth breathing animation
+    if (now - lastLEDUpdate < 20) return;
+    lastLEDUpdate = now;
+    
+    switch (current_mode) {
+        case IDLE_MODE: {
+            // Blue breathing effect using sine-wave approximation
+            // Full breath cycle = ~4 seconds (4000ms period)
+            // sin() returns -1 to +1, we map to 0 to LED_MAX_BRIGHTNESS
+            float breathPhase = (now % 4000) / 4000.0 * 2.0 * PI;
+            uint8_t brightness = (uint8_t)((sin(breathPhase) + 1.0) * 0.5 * LED_MAX_BRIGHTNESS);
+            statusLED.setPixelColor(0, statusLED.Color(0, 0, brightness));  // Blue
+            break;
+        }
+        case RUN_MODE:
+            // Solid green
+            statusLED.setPixelColor(0, statusLED.Color(0, LED_MAX_BRIGHTNESS, 0));
+            break;
+        case PURGE_MODE:
+            // Solid orange (red + ~30% green)
+            statusLED.setPixelColor(0, statusLED.Color(LED_MAX_BRIGHTNESS, LED_MAX_BRIGHTNESS / 3, 0));
+            break;
+        case BURP_MODE:
+            // Solid yellow (red + ~80% green)
+            statusLED.setPixelColor(0, statusLED.Color(LED_MAX_BRIGHTNESS, (LED_MAX_BRIGHTNESS * 4) / 5, 0));
+            break;
+        default:
+            // Unknown mode - dim white
+            statusLED.setPixelColor(0, statusLED.Color(10, 10, 10));
+            break;
+    }
+    statusLED.show();
+}
+
+/**
+ * Update the status LED for passthrough mode - flashing red.
+ * Call this from the passthrough boot loop. Non-blocking, uses millis().
+ * Flashes 500ms on / 500ms off (1 Hz blink rate).
+ *
+ * Usage example:
+ *   // In runPassthroughBootMode() while loop:
+ *   updatePassthroughLED();
+ */
+void updatePassthroughLED() {
+    static unsigned long lastFlashUpdate = 0;
+    unsigned long now = millis();
+    
+    // Update every 20ms for responsiveness
+    if (now - lastFlashUpdate < 20) return;
+    lastFlashUpdate = now;
+    
+    // 500ms on, 500ms off = 1 second period
+    bool ledOn = ((now % 1000) < 500);
+    if (ledOn) {
+        statusLED.setPixelColor(0, statusLED.Color(LED_MAX_BRIGHTNESS, 0, 0));  // Red
+    } else {
+        statusLED.setPixelColor(0, statusLED.Color(0, 0, 0));  // Off
+    }
+    statusLED.show();
+}
+
+/**
+ * Initialize the WS2812B status LED.
+ * Call once during setup() or passthrough init. Sets LED to off initially.
+ *
+ * Usage example:
+ *   initializeStatusLED();  // Call in setup() before main loop
+ */
+void initializeStatusLED() {
+    statusLED.begin();
+    statusLED.setBrightness(255);  // Brightness controlled per-pixel via color values
+    statusLED.setPixelColor(0, statusLED.Color(0, 0, 0));  // Start OFF
+    statusLED.show();
+    Serial.println("✓ WS2812B status LED initialized on GPIO9");
+}
 
 // =====================================================================
 // SERIAL WATCHDOG FUNCTION
@@ -1001,16 +1131,13 @@ void handleI2CWrite(int numBytes) {
                     value |= 0x10;  // Force V6 bit ON regardless of what master sent
                 }
                 
-                // Write to gpioA_value with short mutex timeout
-                // I2C callbacks must be fast - use 1ms timeout max
-                if (relayMutex != NULL && xSemaphoreTake(relayMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
-                    gpioA_value = value;
-                    xSemaphoreGive(relayMutex);
-                } else {
-                    // Mutex busy - write anyway (volatile write is atomic for uint8_t)
-                    gpioA_value = value;
-                }
-                mcpWriteOutputsToPhysicalPins();
+                // Store value via volatile write (atomic for uint8_t on ESP32)
+                // Do NOT call mcpWriteOutputsToPhysicalPins() here!
+                // GPIO writes + mutex waits cause clock stretching that blocks the
+                // I2C bus, preventing the master from reaching the ADS1015 at 0x48.
+                // The task loop picks up pendingRelayWrite within 1-50ms instead.
+                gpioA_value = value;
+                pendingRelayWrite = true;  // Deferred - task loop does actual pin writes
                 break;
                 
             case GPIOB:
@@ -1044,88 +1171,150 @@ void handleI2CWrite(int numBytes) {
         reg++;  // Sequential addressing
     }
     
+    // Rebuild register file immediately so the next I2C read reflects this write.
+    // This is CRITICAL for IPOL: Linux writes IPOLB=0x01 then immediately reads GPIOB.
+    // Without rebuilding, the read returns the stale (non-inverted) value and Linux
+    // sees a false overfill alarm. This function is fast (~1-2µs, just 22 byte writes).
+    // NOTE: mcpWriteOutputsToPhysicalPins() is the slow operation (mutex + GPIO writes)
+    // and is deferred to the task loop via pendingRelayWrite flag -- NOT called here.
+    rebuildMcpRegisterFile();
+    
     i2cLastGoodTransaction = millis();
 }
 
 /**
  * Handle I2C read requests from master
- * RESTORED TO ORIGINAL PROVEN BEHAVIOR
+ * Uses pre-built register file for instant, reliable responses
  * 
  * Returns register value at current register pointer
  * For GPIOA and IODIRA, writes both A and B bytes (sequential read)
  * NO polarity inversion applied - returns raw values
  */
+// Track last GPIOB value sent over I2C for diagnostics
+// Compare with web dashboard's overfillAlarmActive to detect I2C vs GPIO mismatch
+volatile uint8_t lastI2C_GPIOB_sent = 0x01;  // Last value returned for Port B reads
+volatile uint8_t lastI2C_register = 0xFF;     // Last register read by master
+
+// =====================================================================
+// MCP23017 REGISTER SHADOW MAP
+// =====================================================================
+// Pre-built 22-byte register file that mirrors a real MCP23017's memory map.
+// Updated every 50ms by the emulator task loop. The I2C read handler simply
+// copies from this array — no per-register logic, no multi-byte Wire.write()
+// issues, and register pointer auto-increments exactly like real hardware.
+//
+// Register layout (BANK=0):
+//   0x00 IODIRA    0x01 IODIRB    0x02 IPOLA     0x03 IPOLB
+//   0x04 GPINTENA  0x05 GPINTENB  0x06 DEFVALA   0x07 DEFVALB
+//   0x08 INTCONA   0x09 INTCONB   0x0A IOCON     0x0B IOCON(mirror)
+//   0x0C GPPUA     0x0D GPPUB     0x0E INTFA     0x0F INTFB
+//   0x10 INTCAPA   0x11 INTCAPB   0x12 GPIOA     0x13 GPIOB
+//   0x14 OLATA     0x15 OLATB
+// =====================================================================
+#define MCP_REG_COUNT 22
+volatile uint8_t mcpRegisterFile[MCP_REG_COUNT];
+
+/**
+ * Rebuild the MCP23017 register shadow map from current state.
+ * Called from MCP emulator task loop every 50ms (same frequency as pin reads).
+ * Keeps the entire register file consistent and ready for instant I2C reads.
+ *
+ * Usage example:
+ *   rebuildMcpRegisterFile();  // Call after mcpReadInputsFromPhysicalPins()
+ */
+void rebuildMcpRegisterFile() {
+    uint8_t relayState = gpioA_value;  // Volatile read once
+    uint8_t gpiobVal = overfillValidationComplete ? gpioB_value : 0x01;
+    
+    // =====================================================================
+    // CRITICAL: Apply IPOL (Input Polarity) inversion to GPIO reads
+    // =====================================================================
+    // On a real MCP23017, reading the GPIO register returns:
+    //   actual_pin_value XOR IPOL_register
+    // The Adafruit MCP23017 library on Linux may set IPOLB = 0x01 to invert
+    // GPB0 for active-low sensors. Without applying this inversion, the
+    // emulator returns the raw pin value, which Linux interprets BACKWARDS:
+    //   Real MCP23017:  pin HIGH (1) XOR IPOL (1) = 0 → Linux: "normal"
+    //   Old emulator:   pin HIGH (1), no XOR       = 1 → Linux: "OVERFILL!"
+    // =====================================================================
+    uint8_t gpioA_read = relayState ^ ipolA_value;   // Apply Port A inversion
+    uint8_t gpioB_read = gpiobVal   ^ ipolB_value;   // Apply Port B inversion
+    
+    mcpRegisterFile[0x00] = iodirA_value;
+    mcpRegisterFile[0x01] = iodirB_value;
+    mcpRegisterFile[0x02] = ipolA_value;
+    mcpRegisterFile[0x03] = ipolB_value;
+    mcpRegisterFile[0x04] = gpintenA_value;
+    mcpRegisterFile[0x05] = gpintenB_value;
+    mcpRegisterFile[0x06] = defvalA_value;
+    mcpRegisterFile[0x07] = defvalB_value;
+    mcpRegisterFile[0x08] = intconA_value;
+    mcpRegisterFile[0x09] = intconB_value;
+    mcpRegisterFile[0x0A] = iocon_value;
+    mcpRegisterFile[0x0B] = iocon_value;       // IOCON mirror
+    mcpRegisterFile[0x0C] = gppuA_value;
+    mcpRegisterFile[0x0D] = gppuB_value;
+    mcpRegisterFile[0x0E] = 0x00;              // INTFA - no interrupts
+    mcpRegisterFile[0x0F] = 0x00;              // INTFB - no interrupts
+    mcpRegisterFile[0x10] = gpioA_read;        // INTCAPA - GPIO with IPOL applied
+    mcpRegisterFile[0x11] = gpioB_read;        // INTCAPB - GPIO with IPOL applied
+    mcpRegisterFile[0x12] = gpioA_read;        // GPIOA  - GPIO with IPOL applied
+    mcpRegisterFile[0x13] = gpioB_read;        // GPIOB  - GPIO with IPOL applied
+    mcpRegisterFile[0x14] = relayState;        // OLATA  - raw output latch (no IPOL)
+    mcpRegisterFile[0x15] = gpiobVal;          // OLATB  - raw value (no IPOL)
+    
+    // Store the value that will actually be sent for GPIOB (with IPOL applied)
+    lastI2C_GPIOB_sent = gpioB_read;
+}
+
+/**
+ * Handle I2C read requests from master using pre-built register file.
+ * 
+ * CRITICAL FIX: Uses a single Wire.write(buffer, length) call instead of
+ * multiple Wire.write(byte) calls. On ESP32-S3, separate Wire.write() calls
+ * in onRequest may not buffer correctly, causing the master to receive only
+ * the first byte with 0x00 padding for subsequent bytes.
+ *
+ * Also implements register pointer auto-increment (SEQOP=0, MCP23017 default)
+ * so sequential reads advance through registers like real hardware.
+ * Master reads from GPIOA (0x12) expecting 2 bytes will get:
+ *   Byte 1: GPIOA (0x12) = relay states
+ *   Byte 2: GPIOB (0x13) = overfill state
+ */
 void handleI2CRead() {
     i2cTransactionCount++;
     lastRegisterAccessed = registerPointer;
+    lastI2C_register = registerPointer;
     
-    // Note: I2C debug removed - I2C callbacks run on Core 0, corrupt Core 1 serial
+    // Build response buffer starting from current register pointer
+    // Send up to 2 bytes (covers all sequential A+B read patterns)
+    // Uses the pre-built register file for instant, consistent data
+    uint8_t buf[2];
+    uint8_t bytesToSend = 0;
     
-    switch (registerPointer) {
-        case IODIRA:
-            Wire.write(iodirA_value);
-            Wire.write(iodirB_value);
-            break;
-            
-        case IODIRB:
-            Wire.write(iodirB_value);
-            break;
-            
-        case GPIOA:
-            {
-                uint8_t byteA = getRelayStateSafe(); // Thread-safe read
-                // CRITICAL: During startup lockout, report pin HIGH (0x01 = normal)
-                // Real MCP23017: HIGH pin = no overfill alarm
-                // After lockout, use validated gpioB_value
-                uint8_t byteB = overfillValidationComplete ? gpioB_value : 0x01;
-                Wire.write(byteA);
-                Wire.write(byteB);
-            }
-            break;
-            
-        case GPIOB:
-            {
-                // CRITICAL: During startup lockout, report pin HIGH (0x01 = normal)
-                // Real MCP23017: HIGH pin = no overfill alarm
-                uint8_t byteB = overfillValidationComplete ? gpioB_value : 0x01;
-                Wire.write(byteB);
-            }
-            break;
-            
-        case OLATA:
-            {
-                uint8_t byteA = getRelayStateSafe(); // Thread-safe read
-                Wire.write(byteA);
-                Wire.write(0x00);
-            }
-            break;
-            
-        case OLATB:
-            Wire.write(0x00);
-            break;
-            
-        // Return stored values for other registers
-        case IPOLA:
-            Wire.write(ipolA_value);
-            break;
-        case IPOLB:
-            Wire.write(ipolB_value);
-            break;
-        case IOCON:
-        case IOCON_B:
-            Wire.write(iocon_value);
-            break;
-        case GPPUA:
-            Wire.write(gppuA_value);
-            break;
-        case GPPUB:
-            Wire.write(gppuB_value);
-            break;
-            
-        default:
-            Wire.write(0x00);
-            break;
+    if (registerPointer < MCP_REG_COUNT) {
+        buf[0] = mcpRegisterFile[registerPointer];
+        bytesToSend = 1;
+        
+        // For even-numbered registers (Port A), also include the B register
+        // This handles sequential 2-byte reads (e.g., read GPIOA gets GPIOA+GPIOB)
+        if ((registerPointer & 0x01) == 0 && (registerPointer + 1) < MCP_REG_COUNT) {
+            buf[1] = mcpRegisterFile[registerPointer + 1];
+            bytesToSend = 2;
+        }
+    } else {
+        // Unknown register - return 0xFF (idle bus state)
+        buf[0] = 0xFF;
+        bytesToSend = 1;
     }
+    
+    // CRITICAL: Single Wire.write(buffer, length) call for reliability
+    // Avoids ESP32-S3 Wire slave buffering issues with multiple Wire.write(byte) calls
+    Wire.write(buf, bytesToSend);
+    
+    // Auto-increment register pointer (MCP23017 SEQOP=0 default behavior)
+    // After reading, pointer advances to next register for sequential access
+    registerPointer = (registerPointer + bytesToSend) % MCP_REG_COUNT;
     
     i2cLastGoodTransaction = millis();
 }
@@ -1182,8 +1371,8 @@ void i2cBusRecovery() {
         delayMicroseconds(5);
     }
     
-    // Brief delay before reinitializing
-    delay(10);
+    // Brief delay before reinitializing (100µs is enough for bus to settle)
+    delayMicroseconds(100);
 }
 
 /**
@@ -1214,7 +1403,10 @@ void initI2CSlave() {
 void resetI2CSlave() {
     // Note: Serial output removed - runs on Core 0
     Wire.end();
-    delay(50);  // Longer delay to let bus settle
+    delayMicroseconds(500);  // 0.5ms is sufficient for bus settle (was 50ms!)
+    // Old delay(50) blocked the entire Core 0 for 50ms, killing ALL I2C traffic
+    // including ADS1015 transactions. 500µs is more than enough for the I2C
+    // peripheral to release the bus and the pull-ups to restore idle state.
     
     initI2CSlave();
 }
@@ -1298,7 +1490,11 @@ void mcpEmulatorTask(void *parameter) {
     dispShutdownProtectionActive = true;   // Enable protection
     dispShutdownStartupTime = 0;           // Will be set on first check
     
-    // STEP 6: Initialize I2C slave with bus recovery
+    // STEP 6: Build register file BEFORE I2C starts
+    // Ensures first I2C read returns correct data, not uninitialized values
+    rebuildMcpRegisterFile();
+    
+    // STEP 7: Initialize I2C slave with bus recovery
     // ONLY after all state is properly initialized
     // This clears any stuck conditions from previous power cycle
     initI2CSlave();
@@ -1308,12 +1504,31 @@ void mcpEmulatorTask(void *parameter) {
     
     // Main MCP emulator loop
     while (true) {
+        // =====================================================================
+        // DEFERRED RELAY WRITE: Process pending relay commands from I2C callback
+        // =====================================================================
+        // The I2C write callback sets pendingRelayWrite instead of calling
+        // mcpWriteOutputsToPhysicalPins() directly. This avoids clock stretching
+        // inside the I2C callback that would block the bus and prevent the master
+        // from communicating with other slaves (e.g., ADS1015 at 0x48).
+        // Worst-case latency: ~1ms (task loop delay), typical: <1ms.
+        // =====================================================================
+        if (pendingRelayWrite) {
+            pendingRelayWrite = false;
+            mcpWriteOutputsToPhysicalPins();
+            rebuildMcpRegisterFile();  // Update register file immediately after relay change
+        }
+        
         // Update input states every 50ms
         if (millis() - lastUpdate >= 50) {
             mcpReadInputsFromPhysicalPins();
             
             // Check DISP_SHUTDN protection status (handles startup lockout)
             checkDispShutdownProtection();
+            
+            // Rebuild the register shadow map so I2C reads are instant and consistent
+            // This updates all 22 registers from current volatile state in one pass
+            rebuildMcpRegisterFile();
             
             lastUpdate = millis();
         }
@@ -1423,6 +1638,7 @@ const char* control_html = R"rawliteral(
             <div class="row"><span class="lbl">Band</span><span class="val" id="band">--</span></div>
             <div class="row"><span class="lbl">MCC/MNC</span><span class="val" id="mccmnc">--</span></div>
             <div class="row"><span class="lbl">Cell Tower ID</span><span class="val" id="cellId">--</span></div>
+            <div class="row"><span class="lbl">TAC</span><span class="val" id="tac">--</span></div>
             <div class="row"><span class="lbl">BlueCherry Cloud</span><span class="val" id="blueCherry">--</span></div>
         </div>
     </div>
@@ -1434,6 +1650,8 @@ const char* control_html = R"rawliteral(
             <div class="row"><span class="lbl">Board Temp</span><span class="val" id="temperature">--</span></div>
             <div class="row"><span class="lbl">SD Card</span><span class="val" id="sdCard">--</span></div>
             <div class="row"><span class="lbl">Overfill Sensor</span><span class="val" id="overfill">--</span></div>
+            <div class="row"><span class="lbl">GPIO38 Raw / Counts</span><span class="val" id="overfillDebug" style="font-size:0.78em;color:#888;">--</span></div>
+            <div class="row"><span class="lbl">I2C Last Read</span><span class="val" id="i2cDebug" style="font-size:0.78em;color:#888;">--</span></div>
             <div class="row"><span class="lbl">I2C Transactions</span><span class="val" id="i2cTx">--</span></div>
             <div class="row"><span class="lbl">I2C Errors</span><span class="val" id="i2cErr">--</span></div>
             <div class="row"><span class="lbl">Watchdog</span><span class="val" id="watchdog">--</span></div>
@@ -1445,6 +1663,11 @@ const char* control_html = R"rawliteral(
     <div class="card">
         <div class="card-title bg-orange">Configuration</div>
         <div class="card-body">
+            <div class="cfg-row">
+                <span class="lbl">Password:</span>
+                <input type="password" id="cfgPwd" maxlength="20" placeholder="Required" style="padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:14px;width:120px;">
+            </div>
+            <div class="hint">Password required to change settings below</div>
             <div class="cfg-row">
                 <span class="lbl">Device Name:</span>
                 <input type="text" id="nameInput" maxlength="20" value="%DEVICENAME%">
@@ -1533,6 +1756,7 @@ const char* control_html = R"rawliteral(
                         upd('operator',d.operator||'--');upd('band',d.band||'--');
                         upd('mccmnc',d.mcc&&d.mnc?(d.mcc+'/'+d.mnc):'--');
                         upd('cellId',d.cellId||'--');
+                        upd('tac',d.tac||'--');
                         var bc=$('blueCherry');
                         if(d.blueCherryConnected){bc.innerHTML='<span class=ok-text>Connected</span>';}
                         else{bc.innerHTML='<span class=warn-text>Offline</span>';}
@@ -1543,6 +1767,10 @@ const char* control_html = R"rawliteral(
                         var ov=$('overfill');
                         if(d.overfillAlarm){ov.innerHTML='<span class=err-text>ALARM</span>';}
                         else{ov.innerHTML='<span class=ok-text>Normal</span>';}
+                        var od=$('overfillDebug');
+                        if(od){od.innerHTML='Pin='+(d.gpio38Raw?'<span style=color:#2e7d32>HIGH</span>':'<span style=color:#c62828>LOW</span>')+' L:'+d.overfillLowCnt+' H:'+d.overfillHighCnt+(d.overfillValidated?'':' <span style=color:#e65100>LOCKOUT</span>');}
+                        var id=$('i2cDebug');
+                        if(id){id.innerHTML='Reg='+d.i2cLastReg+' Sent=0x'+('0'+d.i2cLastGPIOB.toString(16)).slice(-2)+' IPOL='+(d.ipolB?'<span style=color:#e65100>0x'+('0'+d.ipolB.toString(16)).slice(-2)+'</span>':'off');}
                         upd('i2cTx',d.i2cTransactions);upd('i2cErr',d.i2cErrors);
                         upd('watchdog',d.watchdogEnabled?'Enabled':'Disabled');
                         var wt=$('wdToggle'),wl=$('wdLabel');
@@ -1562,20 +1790,27 @@ const char* control_html = R"rawliteral(
         // Configuration functions - attached to window for onclick handlers
         window.saveName=function(){
             var n=$('nameInput').value.replace(/^\s+|\s+$/g,''),m=$('nameMsg');
+            var p=$('cfgPwd').value;
+            if(!p){m.textContent='Password required';m.style.color='#c62828';return;}
             if(n.length<3||n.length>20){m.textContent='3-20 chars required';m.style.color='#c62828';return;}
             m.textContent='Saving...';m.style.color='#666';
             var x=new XMLHttpRequest();
-            x.open('GET','http://'+IP+'/setdevicename?name='+encodeURIComponent(n),true);
-            x.onload=function(){m.textContent='Saved!';m.style.color='#2e7d32';setTimeout(function(){m.textContent='';},3000);};
+            x.open('GET','http://'+IP+'/setdevicename?name='+encodeURIComponent(n)+'&pwd='+encodeURIComponent(p),true);
+            x.onload=function(){
+                if(x.status===403){m.textContent='Wrong password';m.style.color='#c62828';}
+                else{m.textContent='Saved!';m.style.color='#2e7d32';setTimeout(function(){m.textContent='';},3000);}
+            };
             x.onerror=function(){m.textContent='Error';m.style.color='#c62828';};
             x.send();
         };
         window.setWatchdog=function(on){
+            var p=$('cfgPwd').value;
+            if(!p){alert('Password required to change watchdog setting');$('wdToggle').checked=!on;return;}
             var x=new XMLHttpRequest();
-            x.open('GET','http://'+IP+'/setwatchdog?enabled='+(on?'1':'0'),true);
+            x.open('GET','http://'+IP+'/setwatchdog?enabled='+(on?'1':'0')+'&pwd='+encodeURIComponent(p),true);
             x.onload=function(){
-                $('wdLabel').textContent=on?'ENABLED':'DISABLED';
-                $('wdLabel').style.color=on?'#2e7d32':'#999';
+                if(x.status===403){alert('Wrong password');$('wdToggle').checked=!on;}
+                else{$('wdLabel').textContent=on?'ENABLED':'DISABLED';$('wdLabel').style.color=on?'#2e7d32':'#999';}
             };
             x.send();
         };
@@ -1934,30 +2169,39 @@ void startConfigAP() {
         request->send_P(200, "text/html", control_html, webProcessor);
     });
     
-    // Set watchdog enabled/disabled endpoint
+    // Set watchdog enabled/disabled endpoint (password protected)
+    // Usage: GET /setwatchdog?enabled=1&pwd=gm2026
     server.on("/setwatchdog", HTTP_GET, [](AsyncWebServerRequest *request){
-        if (request->hasParam("enabled")) {
-            int enabledVal = request->getParam("enabled")->value().toInt();
-            watchdogEnabled = (enabledVal == 1);
-            
-            // Save to preferences/EPROM
-            preferences.begin("RMS", false);
-            preferences.putBool("watchdog", watchdogEnabled);
-            preferences.end();
-            
-            Serial.print("Watchdog setting changed: ");
-            Serial.println(watchdogEnabled ? "ENABLED" : "DISABLED");
-            Serial.println("✓ Watchdog setting saved to EPROM");
-            
-            // Reset watchdog state when toggled
-            if (watchdogEnabled) {
-                resetSerialWatchdog();
-            }
-            
-            request->send(200, "text/plain", watchdogEnabled ? "Watchdog ENABLED" : "Watchdog DISABLED");
-        } else {
+        if (!request->hasParam("enabled")) {
             request->send(400, "text/plain", "Missing enabled parameter");
+            return;
         }
+        
+        // Validate password before allowing watchdog changes
+        if (!request->hasParam("pwd") || request->getParam("pwd")->value() != CONFIG_PASSWORD) {
+            Serial.println("[Web] Watchdog change DENIED - wrong or missing password");
+            request->send(403, "text/plain", "Invalid password");
+            return;
+        }
+        
+        int enabledVal = request->getParam("enabled")->value().toInt();
+        watchdogEnabled = (enabledVal == 1);
+        
+        // Save to preferences/EPROM
+        preferences.begin("RMS", false);
+        preferences.putBool("watchdog", watchdogEnabled);
+        preferences.end();
+        
+        Serial.print("Watchdog setting changed: ");
+        Serial.println(watchdogEnabled ? "ENABLED" : "DISABLED");
+        Serial.println("✓ Watchdog setting saved to EPROM (password verified)");
+        
+        // Reset watchdog state when toggled
+        if (watchdogEnabled) {
+            resetSerialWatchdog();
+        }
+        
+        request->send(200, "text/plain", watchdogEnabled ? "Watchdog ENABLED" : "Watchdog DISABLED");
     });
     
     // Set passthrough mode endpoint
@@ -1986,41 +2230,49 @@ void startConfigAP() {
         }
     });
     
-    // Set device name endpoint (manual configuration via web portal)
-    // Usage: GET /setdevicename?name=RND-0007
+    // Set device name endpoint (manual configuration via web portal, password protected)
+    // Usage: GET /setdevicename?name=RND-0007&pwd=gm2026
     // This allows manual entry before Linux device is connected
     server.on("/setdevicename", HTTP_GET, [](AsyncWebServerRequest *request){
-        if (request->hasParam("name")) {
-            String newName = request->getParam("name")->value();
-            
-            // Validate name (alphanumeric, dashes, 3-20 chars)
-            if (newName.length() < 3 || newName.length() > 20) {
-                request->send(400, "text/plain", "Name must be 3-20 characters");
-                return;
-            }
-            
-            // Update device name
-            DeviceName = newName;
-            strncpy(deviceName, newName.c_str(), sizeof(deviceName) - 1);
-            deviceName[sizeof(deviceName) - 1] = '\0';
-            
-            // Save to preferences/EPROM
-            preferences.begin("RMS", false);
-            preferences.putString("DeviceName", DeviceName);
-            preferences.putString("APSuffix", DeviceName);  // Also update AP suffix
-            preferences.end();
-            
-            // Update WiFi AP name
-            updateAPName(DeviceName, true);  // Restart AP with new name
-            apNameFromSerial = false;  // Mark as manually set
-            
-            Serial.println("[Web] Device name manually set to: " + DeviceName);
-            Serial.println("✓ Device name saved to EPROM");
-            
-            request->send(200, "text/plain", "Device name set to: " + DeviceName + "\nWiFi AP updated to: " + String(apSSID));
-        } else {
+        if (!request->hasParam("name")) {
             request->send(400, "text/plain", "Missing name parameter");
+            return;
         }
+        
+        // Validate password before allowing device name changes
+        if (!request->hasParam("pwd") || request->getParam("pwd")->value() != CONFIG_PASSWORD) {
+            Serial.println("[Web] Device name change DENIED - wrong or missing password");
+            request->send(403, "text/plain", "Invalid password");
+            return;
+        }
+        
+        String newName = request->getParam("name")->value();
+        
+        // Validate name (alphanumeric, dashes, 3-20 chars)
+        if (newName.length() < 3 || newName.length() > 20) {
+            request->send(400, "text/plain", "Name must be 3-20 characters");
+            return;
+        }
+        
+        // Update device name
+        DeviceName = newName;
+        strncpy(deviceName, newName.c_str(), sizeof(deviceName) - 1);
+        deviceName[sizeof(deviceName) - 1] = '\0';
+        
+        // Save to preferences/EPROM
+        preferences.begin("RMS", false);
+        preferences.putString("DeviceName", DeviceName);
+        preferences.putString("APSuffix", DeviceName);  // Also update AP suffix
+        preferences.end();
+        
+        // Update WiFi AP name
+        updateAPName(DeviceName, true);  // Restart AP with new name
+        apNameFromSerial = false;  // Mark as manually set
+        
+        Serial.println("[Web] Device name manually set to: " + DeviceName);
+        Serial.println("✓ Device name saved to EPROM (password verified)");
+        
+        request->send(200, "text/plain", "Device name set to: " + DeviceName + "\nWiFi AP updated to: " + String(apSSID));
     });
     
     // API endpoint for AJAX status updates (returns JSON for diagnostic dashboard)
@@ -2071,12 +2323,27 @@ void startConfigAP() {
         json += "\"mcc\":" + String(modemCC) + ",";
         json += "\"mnc\":" + String(modemNC) + ",";
         json += "\"cellId\":" + String(modemCID) + ",";
+        json += "\"tac\":" + String(modemTAC) + ",";
         json += "\"blueCherryConnected\":" + String(blueCherryConnected ? "true" : "false") + ",";
         // IO Board status
         json += "\"version\":\"" + ver + "\",";
         json += "\"temperature\":\"" + String(fahrenheit, 1) + "\",";
         json += "\"sdCardOK\":" + String(isSDCardOK() ? "true" : "false") + ",";
         json += "\"overfillAlarm\":" + String(overfillAlarmActive ? "true" : "false") + ",";
+        // Overfill debug: raw GPIO38 pin state and internal counters
+        // gpio38Raw: 1=HIGH (normal pull-up), 0=LOW (sensor triggered or floating)
+        // overfillLow/High: consecutive reading counters (alarm at 8 LOW, clear at 5 HIGH)
+        // overfillValidated: false during 15-sec boot lockout
+        json += "\"gpio38Raw\":" + String(digitalRead(ESP_OVERFILL)) + ",";
+        json += "\"overfillLowCnt\":" + String(overfillLowCount) + ",";
+        json += "\"overfillHighCnt\":" + String(overfillHighCount) + ",";
+        json += "\"overfillValidated\":" + String(overfillValidationComplete ? "true" : "false") + ",";
+        // I2C debug: last register Linux read and last GPIOB value sent
+        // Helps diagnose if Linux reads wrong register (e.g., INTCAPB=0x11 vs GPIOB=0x13)
+        json += "\"i2cLastReg\":\"0x" + String(lastI2C_register, HEX) + "\",";
+        json += "\"i2cLastGPIOB\":" + String(lastI2C_GPIOB_sent) + ",";
+        // IPOLB: if Linux sets this to 0x01, GPIO reads are inverted (real MCP23017 behavior)
+        json += "\"ipolB\":" + String(ipolB_value) + ",";
         json += "\"i2cTransactions\":" + String(i2cTransactionCount) + ",";
         json += "\"i2cErrors\":" + String(i2cErrorCount) + ",";
         json += "\"watchdogEnabled\":" + String(watchdogEnabled ? "true" : "false") + ",";
@@ -3287,17 +3554,58 @@ size_t buildStatusCbor(uint8_t* cborBuf, size_t bufSize) {
     }
     
     int id = idStr.toInt();
-    int band = modemBand.toInt();
-    cbor_encoder_create_array(&encoder, &arrayEncoder, 9);
+    String sdStatus = isSDCardOK() ? "OK" : "FAULT";
+    
+    // Create 15-element unified status array (matches RMS Board v0.1.33 format)
+    // Both IO Board and RMS Board populate a common server-side table using this layout.
+    // Server receives on port 5686 and distinguishes format by array length (15 = unified).
+    cbor_encoder_create_array(&encoder, &arrayEncoder, 15);
+    
+    // [0] Device ID (integer) - numeric part of device name (e.g., 9199 from "CSX-9199")
     cbor_encode_int(&arrayEncoder, id);
-    cbor_encode_int(&arrayEncoder, band);
-    cbor_encode_text_stringz(&arrayEncoder, modemNetName.c_str());
-    cbor_encode_text_stringz(&arrayEncoder, modemRSRP.c_str());
-    cbor_encode_text_stringz(&arrayEncoder, modemRSRQ.c_str());
+    
+    // [1] Device type (string) - "IO_Board" for this device, "RMS_Board" for RMS
+    cbor_encode_text_stringz(&arrayEncoder, "IO_Board");
+    
+    // [2] Firmware version (string) - e.g., "9.4e"
     cbor_encode_text_stringz(&arrayEncoder, ver.c_str());
-    cbor_encode_int(&arrayEncoder, 0);  // PlcVer removed (always 0 for JSON mode)
+    
+    // [3] LTE band (integer) - e.g., 17
+    cbor_encode_int(&arrayEncoder, modemBand.toInt());
+    
+    // [4] Network/operator name (string) - e.g., "T-Mobile"
+    cbor_encode_text_stringz(&arrayEncoder, modemNetName.c_str());
+    
+    // [5] RSRP - signal power in dBm (string) - e.g., "-89.5"
+    cbor_encode_text_stringz(&arrayEncoder, modemRSRP.c_str());
+    
+    // [6] RSRQ - signal quality in dB (string) - e.g., "-10.2"
+    cbor_encode_text_stringz(&arrayEncoder, modemRSRQ.c_str());
+    
+    // [7] MAC address (string) - e.g., "AA:BB:CC:DD:EE:FF"
     cbor_encode_text_stringz(&arrayEncoder, macStr.c_str());
+    
+    // [8] IMEI (string) - e.g., "351234567890123"
     cbor_encode_text_stringz(&arrayEncoder, imei.c_str());
+    
+    // [9] PLC type (integer) - always 0 for IO Board (no PLC attached)
+    cbor_encode_int(&arrayEncoder, 0);
+    
+    // [10] SD card status (string) - "OK" or "FAULT"
+    cbor_encode_text_stringz(&arrayEncoder, sdStatus.c_str());
+    
+    // [11] MCC - Mobile Country Code (integer) - e.g., 310 for US
+    cbor_encode_int(&arrayEncoder, modemCC);
+    
+    // [12] MNC - Mobile Network Code (integer) - e.g., 410 for T-Mobile
+    cbor_encode_int(&arrayEncoder, modemNC);
+    
+    // [13] Cell ID - E-UTRAN Cell Identity (integer) - e.g., 20878097
+    cbor_encode_int(&arrayEncoder, modemCID);
+    
+    // [14] TAC - Tracking Area Code (integer) - e.g., 10519
+    cbor_encode_int(&arrayEncoder, modemTAC);
+    
     cbor_encoder_close_container(&encoder, &arrayEncoder);
     return cbor_encoder_get_buffer_size(&encoder, cborBuf);
 }
@@ -3588,6 +3896,9 @@ void runPassthroughBootMode(unsigned long timeoutMinutes) {
             Serial1.write(x);
         }
         
+        // Flash red LED during passthrough mode (500ms on/500ms off)
+        updatePassthroughLED();
+        
         // Periodic status (every 5 minutes - less frequent)
         if (millis() - lastStatusTime >= 300000) {
             unsigned long remaining = (timeoutMs - (millis() - startTime)) / 60000;
@@ -3611,6 +3922,9 @@ void setup() {
     
     Serial.begin(115200);
     delay(100);  // Brief delay for serial to stabilize
+    
+    // Initialize WS2812B status LED early (before passthrough check)
+    initializeStatusLED();
     
     // Check for passthrough boot mode (before loading WalterModem library)
     preferences.begin("RMS", false);
@@ -3687,7 +4001,7 @@ void setup() {
     // Send frequency is now controlled by Python (15 seconds), not stored here
     preferences.begin("RMS", false);
     DeviceName = preferences.getString("DeviceName", "CSX-9000");
-    watchdogEnabled = preferences.getBool("watchdog", false);  // Default to disabled
+    watchdogEnabled = preferences.getBool("watchdog", true);   // Default to ENABLED for safety
     preferences.end();
     
     Serial.print("✓ Loaded watchdog setting from EPROM: ");
@@ -3936,6 +4250,26 @@ void loop() {
         checkWeeklyRestartForBlueCherry();
     }
     
+    // =====================================================================
+    // DAILY STATUS MESSAGE (Unified 15-element format - sends to port 5686)
+    // Sends once on first boot and then every 24 hours.
+    // Uses sendStatusUpdateViaSocket() which calls refreshCellSignalInfo(),
+    // buildStatusCbor() (15-element unified array), and sendCborDataViaSocket().
+    // =====================================================================
+    if (lastDailyStatusTime == 0 || currentTime - lastDailyStatusTime >= STATUS_INTERVAL) {
+        Serial.println("##################################################");
+        Serial.println("##### DAILY STATUS - IO_Board (Unified Format) ####");
+        Serial.println("##################################################");
+        refreshCellSignalInfo();
+        if (sendStatusUpdateViaSocket()) {
+            Serial.println("##### Status sent successfully #####");
+        } else {
+            Serial.println("##### Status send failed #####");
+        }
+        Serial.println("##################################################");
+        lastDailyStatusTime = currentTime;
+    }
+    
     // Refresh cell signal info every 60 seconds for web dashboard and serial JSON
     // This updates modemRSRP, modemRSRQ, modemBand, modemNetName globals
     if (currentTime - lastSDCheck >= 60000) {
@@ -3975,6 +4309,10 @@ void loop() {
     
     // Send status JSON to Python device every 15 seconds via RS-232
     checkAndSendStatusToSerial();
+    
+    // Update WS2812B status LED color based on current operating mode
+    // Blue breathing=Idle, Green=Run, Orange=Purge, Yellow=Burp
+    updateStatusLED();
     
     delay(100);
 }

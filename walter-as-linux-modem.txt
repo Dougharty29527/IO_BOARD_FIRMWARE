@@ -5,6 +5,14 @@
  * @copyright DPTechnics bv
  * @brief Walter Modem library examples
  *
+ *    ******************************************
+ *     TO INTEGRATE INTO MAIN IO BOARD SOFTWARE
+ *    ******************************************
+ *     Updated pins to match IO Board
+ *     Modem MUST be set to 921600 with AT Commands Manually
+ *     Use Standard Passthrough Sketch * Must set back for normal operation
+ *
+ * 
  * @section LICENSE
  *
  * Copyright (C) 2023, DPTechnics bv
@@ -51,91 +59,104 @@
 /**
  * @brief The RX pin on which modem data is received.
  */
-#define WALTER_MODEM_PIN_RX 14
+ #define WALTER_MODEM_PIN_RX 14
 
-/**
- * @brief The TX to which modem data must be transmitted.
- */
-#define WALTER_MODEM_PIN_TX 48
-
-/**
- * @brief The RTS pin on the ESP32 side.
- */
-#define WALTER_MODEM_PIN_RTS 21
-
-/**
- * @brief The CTS pin on the ESP32 size.
- */
-#define WALTER_MODEM_PIN_CTS 47
-
-/**
- * @brief The active low modem reset pin.
- */
-#define WALTER_MODEM_PIN_RESET 45
-
-/**
- * @brief The pin to which the TX of the host must be connected.
- */
-#define HOST_SERIAL_PIN_RX 8
-
-/**
- * @brief The pin to which the RX of the host must be connected.
- */
-#define HOST_SERIAL_PIN_TX 9
-
-/**
- * @brief The serial interface to talk to the modem.
- */
-#define ModemSerial Serial1
-
-/**
- * @brief The serial interface to talk to the host.
- */
-#define HostSerial Serial2
-
-void setup() {
-  Serial.begin(115200);
-  delay(2000);
-  
-  pinMode(WALTER_MODEM_PIN_RX, INPUT);
-  pinMode(WALTER_MODEM_PIN_TX, OUTPUT);
-  pinMode(WALTER_MODEM_PIN_CTS, INPUT);
-  pinMode(WALTER_MODEM_PIN_RTS, OUTPUT);
-  pinMode(WALTER_MODEM_PIN_RESET, OUTPUT);
-
-  ModemSerial.begin(
-    921600,
-    SERIAL_8N1,
-    WALTER_MODEM_PIN_RX,
-    WALTER_MODEM_PIN_TX,
-    false,
-    WALTER_MODEM_PIN_RTS,
-    WALTER_MODEM_PIN_CTS);
-
-  HostSerial.begin(
-    921600,
-    SERIAL_8N1,
-    HOST_SERIAL_PIN_RX,
-    HOST_SERIAL_PIN_TX
-  );
-
-  gpio_hold_dis((gpio_num_t) WALTER_MODEM_PIN_RESET);
-  digitalWrite(WALTER_MODEM_PIN_RESET, LOW);
-  delay(1000);
-  digitalWrite(WALTER_MODEM_PIN_RESET, HIGH);
-  gpio_hold_en((gpio_num_t) WALTER_MODEM_PIN_RESET);
-
-  Serial.println("Ready for PPP session");
-}
-
-void loop() {
-  if(HostSerial.available()) {
-    int x = HostSerial.read();
-    ModemSerial.write(x);
-  }
-
-  if(ModemSerial.available()) {
-    int x = ModemSerial.read();
-    HostSerial.write(x);
-  }
-}
+ /**
+  * @brief The TX to which modem data must be transmitted.
+  */
+ #define WALTER_MODEM_PIN_TX 48
+ 
+ /**
+  * @brief The RTS pin on the ESP32 side.
+  */
+ #define WALTER_MODEM_PIN_RTS 21
+ 
+ /**
+  * @brief The CTS pin on the ESP32 size.
+  */
+ #define WALTER_MODEM_PIN_CTS 47
+ 
+ /**
+  * @brief The active low modem reset pin.
+  */
+ #define WALTER_MODEM_PIN_RESET 45
+ 
+ /**
+  * @brief The pin to which the TX of the host must be connected.
+  * *** UPDATED FOR OUR IO BOARD RX 44 / TX 43 ***
+  *******************************************************
+  */
+ #define HOST_SERIAL_PIN_RX 44
+ 
+ /**
+  * @brief The pin to which the RX of the host must be connected.
+  */
+ #define HOST_SERIAL_PIN_TX 43
+ 
+ /**
+  * @brief The serial interface to talk to the modem.
+  */
+ #define ModemSerial Serial1
+ 
+ /**
+  * @brief The serial interface to talk to the host.
+  */
+ #define HostSerial Serial2
+ 
+ 
+ 
+ void setup() {
+       // Enable 3.3V power
+     pinMode(0, OUTPUT);
+     digitalWrite(0, LOW);
+     Serial.println("✓ 3.3V power enabled");
+   
+   
+   
+   
+   
+   Serial.begin(115200);
+   delay(2000);
+   
+   pinMode(WALTER_MODEM_PIN_RX, INPUT);
+   pinMode(WALTER_MODEM_PIN_TX, OUTPUT);
+   pinMode(WALTER_MODEM_PIN_CTS, INPUT);
+   pinMode(WALTER_MODEM_PIN_RTS, OUTPUT);
+   pinMode(WALTER_MODEM_PIN_RESET, OUTPUT);
+ 
+   ModemSerial.begin(
+     115200,
+     SERIAL_8N1,
+     WALTER_MODEM_PIN_RX,
+     WALTER_MODEM_PIN_TX,
+     false,
+     WALTER_MODEM_PIN_RTS,
+     WALTER_MODEM_PIN_CTS);
+ 
+   HostSerial.begin(
+     115200,
+     SERIAL_8N1,
+     HOST_SERIAL_PIN_RX,
+     HOST_SERIAL_PIN_TX
+   );
+ 
+   gpio_hold_dis((gpio_num_t) WALTER_MODEM_PIN_RESET);
+   digitalWrite(WALTER_MODEM_PIN_RESET, LOW);
+   delay(1000);
+   digitalWrite(WALTER_MODEM_PIN_RESET, HIGH);
+   gpio_hold_en((gpio_num_t) WALTER_MODEM_PIN_RESET);
+ 
+   Serial.println("Ready for PPP session");
+ }
+ 
+ void loop() {
+   if(HostSerial.available()) {
+     int x = HostSerial.read();
+     ModemSerial.write(x);
+   }
+ 
+   if(ModemSerial.available()) {
+     int x = ModemSerial.read();
+     HostSerial.write(x);
+   }
+ }
