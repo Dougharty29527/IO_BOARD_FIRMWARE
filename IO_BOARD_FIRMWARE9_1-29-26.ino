@@ -1,7 +1,7 @@
 /* ********************************************
  *  
- *  Walter IO Board Firmware - Rev 9.4
- *  Date: 2/5/2026
+ *  Walter IO Board Firmware - Rev 9.4d
+ *  Date: 2/6/2026
  *  Written By: Todd Adams & Doug Harty
  *  
  *  Based on:
@@ -12,6 +12,49 @@
  *  =====================================================================
  *  REVISION HISTORY
  *  =====================================================================
+ *  
+ *  Rev 9.4d (2/6/2026) - Cell Tower Info + Scheduled Firmware Checks
+ *  - NEW: Cell tower info on web dashboard (MCC/MNC, Cell ID)
+ *  - NEW: Cell tower info in serial JSON to modem.py (operator, band, mcc, mnc, cellId)
+ *  - Uses WalterModem getCellInformation() for all cellular fields
+ *  - Changed firmware/OTA check from frequency-based (every 60s) to schedule-based
+ *  - Schedule: 7:00 AM - 1:00 PM EST, every 15 minutes (25 checks/day)
+ *  - First boot still runs immediately to sync modem time
+ *  - Uses currentTimestamp (UTC) converted to EST for schedule evaluation
+ *  - Prevents duplicate checks within same 15-minute slot
+ *  - Reduces unnecessary modem traffic outside business hours
+ *  - FIXED: RSRP/RSRQ/Operator/Band showing "0"/"Unknown"/"--" on web dashboard
+ *    * lteConnect() now stores cell info in globals when first retrieved
+ *    * Added refreshCellSignalInfo() called every 60s in main loop
+ *    * Renamed buildStatusUpdate() -> refreshCellSignalInfo() for clarity
+ *    * Fixed signal bar showing "Excellent" for RSRP=0 (0 means "no data")
+ *    * Dashboard shows "--" with gray bar until real signal data arrives
+ *  
+ *  Rev 9.4b (2/6/2026) - Captive Portal Fix (CRITICAL)
+ *  - FIXED: Blank web page caused by AsyncWebServer template processor
+ *    * All literal % in HTML/CSS/JS must be escaped as %% when using webProcessor
+ *    * Template engine was treating CSS "width:0%" and JS "+'%'" as template vars
+ *    * This deleted large chunks of HTML between consecutive % characters
+ *  - Rebuilt captive portal for rock-solid detection on all platforms:
+ *    * iOS/macOS: /hotspot-detect.html handler
+ *    * Android: /generate_204 handler (returns 200 instead of expected 204)
+ *    * Windows: /connecttest.txt, /ncsi.txt, /fwlink handlers
+ *    * Firefox: /canonical.html handler
+ *    * Catch-all: 302 redirect for any unrecognized URL
+ *  - Lightweight captive portal landing page with dashboard link
+ *  - Switched AJAX from fetch() to XMLHttpRequest for wider captive portal compat
+ *  - Uses absolute URLs (http://192.168.4.1/...) in all AJAX calls
+ *  - WiFi mode explicitly set to WIFI_AP with stabilization delay
+ *  
+ *  Rev 9.4a (2/6/2026) - Code Cleanup
+ *  - REMOVED: 10 unused global variables (webOverrideActive, lastWebActivity,
+ *    WEB_OVERRIDE_TIMEOUT, mode_start_time, previousMillis, statusInterval,
+ *    passthroughStartTime, passthroughTimeoutMs, DEFAULT_PASSTHROUGH_TIMEOUT_MS,
+ *    profile, global id, imeisv, svn, global lastStatusTime)
+ *  - REMOVED: Dead set_relay_mode() function (never called after web relay removal)
+ *  - REMOVED: Web override timeout check from MCP emulator loop
+ *  - REMOVED: Web override priority check from mcpWriteOutputsToPhysicalPins()
+ *  - Relay control exclusively via I2C from Linux master (cleaner code path)
  *  
  *  Rev 9.4 (2/5/2026) - Simplified Diagnostic Dashboard
  *  - REMOVED: Web relay control (mode buttons, individual relay buttons)
@@ -154,7 +197,7 @@
  ***********************************************/
 
 // Define the software version as a macro
-#define VERSION "Rev 9.4"
+#define VERSION "Rev 9.4d"
 String ver = VERSION;
 
 // ### Libraries ###
@@ -289,15 +332,9 @@ volatile bool i2cDebugEnabled = false;  // Set true to enable verbose I2C loggin
 
 // Thread safety
 SemaphoreHandle_t relayMutex = NULL;
-// Web override removed in Rev 9.4 - web interface is now read-only
-// Relay control is exclusively managed by I2C from the Linux master
-bool webOverrideActive = false;       // Kept for compatibility, always false
-unsigned long lastWebActivity = 0;
-const unsigned long WEB_OVERRIDE_TIMEOUT = 5000;
 
-// Current mode tracking
+// Current mode tracking (read-only from web dashboard, set by I2C master)
 RunMode current_mode = IDLE_MODE;
-unsigned long mode_start_time = 0;
 
 // Serial watchdog variables
 bool watchdogEnabled = false;                    // Watchdog feature enable/disable flag
@@ -385,24 +422,22 @@ char dataBuffer[MAX_BUFFER_SIZE];
 static char outgoingMsg[MAX_BUFFER_SIZE] = "";
 uint8_t cborBuffer[1024];
 char deviceName[20];
-unsigned long previousMillis = 0;
 String Modem_Status = "Unknown";
-String modemBand = "";
-String modemNetName = "";
-String modemRSRP = "";
-String modemRSRQ = "";
+String modemBand = "";            // LTE band number (e.g. "12", "4")
+String modemNetName = "";         // Operator/network name (e.g. "T-Mobile")
+String modemRSRP = "";            // Reference Signal Received Power in dBm (e.g. "-89.5")
+String modemRSRQ = "";            // Reference Signal Received Quality in dB (e.g. "-11.2")
+uint16_t modemCC = 0;             // Country Code (e.g. 310 for US)
+uint16_t modemNC = 0;             // Network Code (e.g. 260 for T-Mobile US)
+uint32_t modemCID = 0;            // Cell ID - unique identifier of the serving cell tower
 String imei = "";
-String imeisv = "";
-String svn = "";
 String macStr = "";
 int64_t currentTimestamp = 0;
 uint32_t lastMillis = 0;
 bool firstTime = true;
-static unsigned long lastStatusTime = 0;
-static unsigned long statusInterval = 36000000;
 static unsigned long lastSendTime = 0;
-static unsigned long lastFirmwareTime = 0;
-static unsigned long lastFirmwareFreq = 60000;
+static unsigned long lastFirmwareCheckMillis = 0;   // millis() of last firmware check
+static bool firmwareCheckDoneThisSlot = false;       // Prevents re-checking within same 15-min slot
 static unsigned long readTime = 0;
 static unsigned int readInterval = 5000;
 static unsigned long int seq = 0;
@@ -437,9 +472,6 @@ const unsigned long STATUS_SEND_INTERVAL = 15000;  // 15 seconds in milliseconds
 // NOTE: Passthrough mode is NOT persisted - always returns to normal on reboot
 bool passthroughMode = false;      // True when passthrough is active
 int passthroughValue = 0;          // 0=normal operation, 1=passthrough active (sent in JSON status)
-unsigned long passthroughStartTime = 0;   // Timestamp when passthrough mode was entered
-unsigned long passthroughTimeoutMs = 0;   // Timeout in milliseconds (set from "remote XX" message)
-const unsigned long DEFAULT_PASSTHROUGH_TIMEOUT_MS = 60UL * 60UL * 1000UL;  // Default 60 minutes
 
 // Forward declarations for passthrough functions (needed for lambda in web server)
 bool sendPassthroughRequestToLinux(unsigned long timeoutMinutes);
@@ -455,12 +487,10 @@ uint8_t incomingBuf[256] = { 0 };
 uint16_t counter = 0;
 
 String idStr = "";
-int id;
 int readings[12][10];
 int readingCount = 0;
 float pressure = 0.0;
 int pres_scaled = 0;
-int profile=2;
 int temp_scaled = 0;
 int cycles = 0, faults = 0, mode = 0;
 float current = -99.8;
@@ -667,7 +697,7 @@ void resetSerialWatchdog() {
 
 /**
  * Thread-safe relay write with mutex protection
- * Can be called from web interface or set_relay_mode
+ * Can be called from I2C handler or internal functions
  * Uses 10ms timeout - long enough for normal use, short enough to not block
  * 
  * CRITICAL: DISP_SHUTDN protection enforced - forces ON during startup lockout
@@ -729,46 +759,7 @@ uint8_t getRelayStateSafe() {
     return value;
 }
 
-/**
- * Set relay mode using predefined patterns
- * Integrates with MCP emulator for web control
- */
-void set_relay_mode(RunMode mode) {
-    current_mode = mode;
-    mode_start_time = millis();
-    
-    uint8_t relay_pattern = 0x00;
-    
-    switch (mode) {
-        case IDLE_MODE:
-            relay_pattern = 0x00;  // All relays OFF (except V6)
-            break;
-            
-        case RUN_MODE:
-            relay_pattern = 0x0B;  // Motor + CR1 + CR5 = 0000 1011
-            break;
-            
-        case PURGE_MODE:
-            relay_pattern = 0x05;  // Motor + CR2 = 0000 0101
-            break;
-            
-        case BURP_MODE:
-            relay_pattern = 0x08;  // CR5 only = 0000 1000
-            break;
-    }
-    
-    // V6 (bit 4, 0x10) MUST stay ON - can ONLY be turned off via explicit I2C command
-    // CRITICAL: ALWAYS preserve V6 state from current gpioA_value unless I2C explicitly clears it
-    // This function is for web/QC control of relays 0-3, NOT for V6 control
-    relay_pattern |= (gpioA_value & 0x10);  // Preserve current V6 state
-    
-    setRelayStateSafe(relay_pattern);
-    
-    // Mark as web override when called from web interface
-    if (webOverrideActive) {
-        lastWebActivity = millis();
-    }
-}
+// set_relay_mode() removed in Rev 9.4 - relay control is exclusively via I2C from Linux master
 
 // =====================================================================
 // MCP23017 EMULATOR FUNCTIONS
@@ -901,11 +892,6 @@ void checkDispShutdownProtection() {
  * CRITICAL: DISP_SHUTDN protection enforced here - forces ON during lockout
  */
 bool mcpWriteOutputsToPhysicalPins() {
-    // Only apply I2C relay changes if web interface is not active
-    if (webOverrideActive && (millis() - lastWebActivity < WEB_OVERRIDE_TIMEOUT)) {
-        return false; // Web has priority - ignore I2C relay commands
-    }
-    
     // Capture gpioA_value atomically ONCE at the start
     // This prevents race conditions where value changes mid-function
     uint8_t capturedValue = gpioA_value;
@@ -1306,11 +1292,6 @@ void mcpEmulatorTask(void *parameter) {
             // Check DISP_SHUTDN protection status (handles startup lockout)
             checkDispShutdownProtection();
             
-            // Check if web override has timed out
-            if (webOverrideActive && (millis() - lastWebActivity > WEB_OVERRIDE_TIMEOUT)) {
-                webOverrideActive = false;
-            }
-            
             lastUpdate = millis();
         }
         
@@ -1331,53 +1312,70 @@ void mcpEmulatorTask(void *parameter) {
 // =====================================================================
 // Embedded directly in .ino file for iOS captive portal compatibility
 
+// CRITICAL: In AsyncWebServer with a template processor, every literal % must be
+// escaped as %% otherwise the processor treats text between % signs as template
+// variables and DELETES chunks of HTML. This was the root cause of the blank page.
 const char* control_html = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Walter IO Board - Rev 9.4</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Walter IO Board - Rev 9.4d</title>
     <style>
-        * { box-sizing: border-box; }
-        body { font-family: -apple-system, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 15px; background: #f0f2f5; }
-        .hdr { text-align: center; padding: 15px 0; }
-        .hdr h1 { margin: 0; font-size: 1.4em; color: #1a1a2e; }
-        .hdr p { margin: 4px 0 0; color: #666; font-size: 0.85em; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html { -webkit-text-size-adjust: 100%%; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 12px; background: #f0f2f5; color: #222; }
+        .hdr { text-align: center; padding: 12px 0; }
+        .hdr h1 { font-size: 1.3em; color: #1a1a2e; }
+        .hdr p { margin: 4px 0 0; color: #666; font-size: 0.82em; }
         .badge { position: fixed; top: 8px; right: 8px; padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; z-index: 100; }
         .badge.ok { background: #4CAF50; color: #fff; }
-        .badge.err { background: #f44336; color: #fff; }
+        .badge.err { background: #f44336; color: #fff; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%%,100%%{opacity:1} 50%%{opacity:0.6} }
         .card { background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 12px; overflow: hidden; }
-        .card-title { font-size: 0.9em; font-weight: 700; color: #fff; padding: 8px 14px; margin: 0; }
+        .card-title { font-size: 0.88em; font-weight: 700; color: #fff; padding: 8px 14px; }
         .card-body { padding: 10px 14px; }
         .bg-blue { background: #1565c0; }
         .bg-green { background: #2e7d32; }
         .bg-gray { background: #455a64; }
         .bg-orange { background: #e65100; }
-        .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #f0f0f0; }
+        .row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid #f5f5f5; }
         .row:last-child { border-bottom: none; }
-        .lbl { color: #777; font-size: 0.85em; }
-        .val { font-weight: 600; font-size: 0.95em; color: #222; text-align: right; transition: background 0.3s; }
-        .val.flash { background: #e8f5e9; border-radius: 3px; }
+        .lbl { color: #777; font-size: 0.84em; flex-shrink: 0; }
+        .val { font-weight: 600; font-size: 0.92em; color: #222; text-align: right; }
         .ok-text { color: #2e7d32; }
         .warn-text { color: #e65100; }
         .err-text { color: #c62828; font-weight: bold; }
-        .signal-bar { display: inline-block; width: 60px; height: 10px; background: #e0e0e0; border-radius: 5px; overflow: hidden; vertical-align: middle; margin-left: 6px; }
-        .signal-fill { height: 100%; border-radius: 5px; transition: width 0.5s; }
-        .cfg-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; }
+        .signal-wrap { display: inline-flex; align-items: center; gap: 6px; }
+        .signal-bar { display: inline-block; width: 60px; height: 10px; background: #e0e0e0; border-radius: 5px; overflow: hidden; }
+        .signal-fill { height: 100%%; border-radius: 5px; transition: width 0.5s; }
+        .cfg-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; flex-wrap: wrap; }
         .cfg-row input[type=text] { padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; width: 140px; }
         .btn { padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 0.85em; color: #fff; }
-        .btn-green { background: #4CAF50; }
-        .btn-green:active { background: #388E3C; }
-        .ts { text-align: center; font-size: 0.7em; color: #aaa; padding: 6px; }
+        .btn-save { background: #4CAF50; }
+        .btn-save:active { background: #388E3C; }
+        .btn-pt { background: #e65100; }
+        .btn-pt:active { background: #bf360c; }
+        .hint { font-size: 0.72em; color: #999; padding: 2px 0 6px; }
+        .ts { text-align: center; font-size: 0.7em; color: #aaa; padding: 8px; }
+        .modal-bg { display: none; position: fixed; top: 0; left: 0; width: 100%%; height: 100%%; background: rgba(0,0,0,0.5); z-index: 200; justify-content: center; align-items: center; }
+        .modal { background: #fff; border-radius: 8px; max-width: 90%%; width: 360px; overflow: hidden; }
+        .modal-hdr { background: #e65100; color: #fff; padding: 12px 16px; font-weight: 700; }
+        .modal-body { padding: 16px; color: #333; font-size: 0.9em; line-height: 1.5; }
+        .modal-body ul { margin: 4px 0 10px; padding-left: 18px; }
+        .modal-foot { padding: 10px 16px; background: #f5f5f5; display: flex; justify-content: flex-end; gap: 8px; }
+        .btn-cancel { background: #9e9e9e; }
+        .btn-danger { background: #c62828; }
     </style>
 </head>
 <body>
     <div class="badge ok" id="connBadge">Connected</div>
     <div class="hdr">
         <h1>Walter IO Board</h1>
-        <p>Service Diagnostic Dashboard - Rev 9.4</p>
+        <p>Service Diagnostic Dashboard - Rev 9.4d</p>
     </div>
+
     <div class="card">
         <div class="card-title bg-blue">Serial Data (from Linux Device)</div>
         <div class="card-body">
@@ -1390,23 +1388,27 @@ const char* control_html = R"rawliteral(
             <div class="row"><span class="lbl">Fault Code</span><span class="val" id="fault">--</span></div>
         </div>
     </div>
+
     <div class="card">
         <div class="card-title bg-green">Cellular Modem</div>
         <div class="card-body">
             <div class="row"><span class="lbl">LTE Status</span><span class="val" id="lteStatus">--</span></div>
-            <div class="row"><span class="lbl">RSRP (Signal Strength)</span><span class="val" id="rsrp">--</span></div>
-            <div class="row"><span class="lbl">RSRQ (Signal Quality)</span><span class="val" id="rsrq">--</span></div>
-            <div class="row"><span class="lbl">Signal Level</span><span class="val" id="signalLevel">--<div class="signal-bar"><div class="signal-fill" id="signalBar" style="width:0%;background:#ccc;"></div></div></span></div>
+            <div class="row"><span class="lbl">RSRP (Signal)</span><span class="val" id="rsrp">--</span></div>
+            <div class="row"><span class="lbl">RSRQ (Quality)</span><span class="val" id="rsrq">--</span></div>
+            <div class="row"><span class="lbl">Signal Level</span><span class="val"><span class="signal-wrap"><span id="signalLevel">--</span><span class="signal-bar"><span class="signal-fill" id="signalBar"></span></span></span></span></div>
             <div class="row"><span class="lbl">Operator</span><span class="val" id="operator">--</span></div>
             <div class="row"><span class="lbl">Band</span><span class="val" id="band">--</span></div>
+            <div class="row"><span class="lbl">MCC/MNC</span><span class="val" id="mccmnc">--</span></div>
+            <div class="row"><span class="lbl">Cell Tower ID</span><span class="val" id="cellId">--</span></div>
             <div class="row"><span class="lbl">BlueCherry Cloud</span><span class="val" id="blueCherry">--</span></div>
         </div>
     </div>
+
     <div class="card">
         <div class="card-title bg-gray">IO Board Status</div>
         <div class="card-body">
-            <div class="row"><span class="lbl">Firmware Version</span><span class="val" id="version">--</span></div>
-            <div class="row"><span class="lbl">Board Temperature</span><span class="val" id="temperature">--</span></div>
+            <div class="row"><span class="lbl">Firmware</span><span class="val" id="version">--</span></div>
+            <div class="row"><span class="lbl">Board Temp</span><span class="val" id="temperature">--</span></div>
             <div class="row"><span class="lbl">SD Card</span><span class="val" id="sdCard">--</span></div>
             <div class="row"><span class="lbl">Overfill Sensor</span><span class="val" id="overfill">--</span></div>
             <div class="row"><span class="lbl">I2C Transactions</span><span class="val" id="i2cTx">--</span></div>
@@ -1416,16 +1418,17 @@ const char* control_html = R"rawliteral(
             <div class="row"><span class="lbl">MAC Address</span><span class="val" id="mac">--</span></div>
         </div>
     </div>
+
     <div class="card">
         <div class="card-title bg-orange">Configuration</div>
         <div class="card-body">
             <div class="cfg-row">
                 <span class="lbl">Device Name:</span>
                 <input type="text" id="nameInput" maxlength="20" value="%DEVICENAME%">
-                <button class="btn btn-green" onclick="saveName()">Save</button>
+                <button class="btn btn-save" onclick="saveName()">Save</button>
                 <span id="nameMsg" style="font-size:11px;"></span>
             </div>
-            <div style="font-size:0.75em;color:#999;padding:2px 0 6px;">Used for WiFi AP name and data identification</div>
+            <div class="hint">Used for WiFi AP name and data identification</div>
             <div class="cfg-row">
                 <span class="lbl">Serial Watchdog:</span>
                 <label style="display:flex;align-items:center;cursor:pointer;">
@@ -1433,89 +1436,143 @@ const char* control_html = R"rawliteral(
                     <span id="wdLabel" style="font-weight:600;font-size:0.85em;">--</span>
                 </label>
             </div>
-            <div style="font-size:0.75em;color:#999;padding:2px 0 8px;">Pulses GPIO39 if no serial data for 30 min</div>
+            <div class="hint">Pulses GPIO39 if no serial data for 30 min</div>
             <div style="border-top:1px solid #eee;padding-top:10px;margin-top:4px;">
                 <div class="cfg-row">
                     <span class="lbl">Modem Passthrough:</span>
-                    <button class="btn" id="ptBtn" onclick="togglePassthrough()" style="background:#e65100;">Enter Passthrough</button>
+                    <button class="btn btn-pt" id="ptBtn" onclick="showPtModal()">Enter Passthrough</button>
                     <span id="ptStatus" style="font-weight:600;font-size:0.85em;color:#999;">Inactive</span>
                 </div>
-                <div style="font-size:0.75em;color:#999;padding:2px 0;">Bridges serial to modem for PPP. ESP32 restarts and auto-returns after 60 min.</div>
+                <div class="hint">Bridges serial to modem for PPP. ESP32 restarts and auto-returns after 60 min.</div>
             </div>
         </div>
     </div>
-    <div id="ptModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:200;justify-content:center;align-items:center;">
-        <div style="background:#fff;border-radius:8px;max-width:90%;width:360px;overflow:hidden;">
-            <div style="background:#e65100;color:#fff;padding:12px 16px;font-weight:700;">Enter Passthrough Mode?</div>
-            <div style="padding:16px;color:#333;font-size:0.9em;line-height:1.5;">
-                <p style="margin:0 0 8px;"><b>This will:</b></p>
-                <ul style="margin:0 0 10px;padding-left:18px;"><li>Restart ESP32 into passthrough mode</li><li>Bridge RS-232 serial directly to modem</li><li>Disable WiFi and web server</li></ul>
-                <p style="margin:0;color:#c62828;"><b>Auto-returns to normal after 60 min.</b></p>
+
+    <div class="modal-bg" id="ptModal">
+        <div class="modal">
+            <div class="modal-hdr">Enter Passthrough Mode?</div>
+            <div class="modal-body">
+                <p style="margin-bottom:8px;"><b>This will:</b></p>
+                <ul><li>Restart ESP32 into passthrough mode</li><li>Bridge RS-232 serial directly to modem</li><li>Disable WiFi and web server</li></ul>
+                <p style="color:#c62828;"><b>Auto-returns to normal after 60 min.</b></p>
             </div>
-            <div style="padding:10px 16px;background:#f5f5f5;display:flex;justify-content:flex-end;gap:8px;">
-                <button class="btn" onclick="closePtModal()" style="background:#9e9e9e;">Cancel</button>
-                <button class="btn" onclick="confirmPassthrough()" style="background:#c62828;">Enable</button>
+            <div class="modal-foot">
+                <button class="btn btn-cancel" onclick="closePtModal()">Cancel</button>
+                <button class="btn btn-danger" onclick="confirmPassthrough()">Enable</button>
             </div>
         </div>
     </div>
+
     <div class="ts" id="lastUpdate">Waiting for data...</div>
+
     <script>
-        let errs=0;
-        function flash(id){const e=document.getElementById(id);if(e){e.classList.add('flash');setTimeout(()=>e.classList.remove('flash'),500);}}
-        function upd(id,v){const e=document.getElementById(id);if(e&&e.textContent!==String(v)){e.textContent=v;flash(id);}}
-        function conn(ok){const b=document.getElementById('connBadge');b.textContent=ok?'Connected':'Disconnected';b.className='badge '+(ok?'ok':'err');if(ok)errs=0;}
-        function signalColor(rsrp){const v=parseFloat(rsrp);if(isNaN(v))return{pct:0,clr:'#ccc',txt:'--'};if(v>=-80)return{pct:100,clr:'#4CAF50',txt:'Excellent'};if(v>=-90)return{pct:75,clr:'#8BC34A',txt:'Good'};if(v>=-100)return{pct:50,clr:'#FF9800',txt:'Fair'};return{pct:25,clr:'#f44336',txt:'Poor'};}
-        function poll(){fetch('/api/status').then(r=>{if(!r.ok)throw 0;return r.json();}).then(d=>{
-            conn(true);
-            // Serial data
-            const ss=document.getElementById('serialStatus');
-            if(d.serialActive){ss.textContent='Receiving Data';ss.className='val ok-text';}
-            else{ss.textContent='No Data';ss.className='val err-text';}
-            upd('deviceId',d.deviceName||'--');
-            upd('pressure',d.pressure);upd('current',d.current);upd('mode',d.mode);
-            upd('cycles',d.cycles);
-            const fe=document.getElementById('fault');if(fe){fe.textContent=d.fault||'0';fe.className='val'+(parseInt(d.fault)>0?' warn-text':'');}
-            // Modem
-            const le=document.getElementById('lteStatus');
-            if(d.lteConnected){le.innerHTML='<span class="ok-text">Connected</span>';}else{le.innerHTML='<span class="err-text">Disconnected</span>';}
-            upd('rsrp',d.rsrp+' dBm');upd('rsrq',d.rsrq+' dB');
-            const s=signalColor(d.rsrp);upd('signalLevel',s.txt);
-            const bar=document.getElementById('signalBar');if(bar){bar.style.width=s.pct+'%';bar.style.background=s.clr;}
-            upd('operator',d.operator||'--');upd('band',d.band||'--');
-            const bc=document.getElementById('blueCherry');
-            if(d.blueCherryConnected){bc.innerHTML='<span class="ok-text">Connected</span>';}else{bc.innerHTML='<span class="warn-text">Offline</span>';}
-            // IO Board
-            upd('version',d.version);upd('temperature',d.temperature+' F');
-            const sd=document.getElementById('sdCard');
-            if(d.sdCardOK){sd.innerHTML='<span class="ok-text">OK</span>';}else{sd.innerHTML='<span class="err-text">FAULT</span>';}
-            const ov=document.getElementById('overfill');
-            if(d.overfillAlarm){ov.innerHTML='<span class="err-text">ALARM</span>';}else{ov.innerHTML='<span class="ok-text">Normal</span>';}
-            upd('i2cTx',d.i2cTransactions);upd('i2cErr',d.i2cErrors);
-            upd('watchdog',d.watchdogEnabled?'Enabled':'Disabled');
-            const wt=document.getElementById('wdToggle'),wl=document.getElementById('wdLabel');
-            if(wt){wt.checked=d.watchdogEnabled;}
-            if(wl){wl.textContent=d.watchdogEnabled?'ENABLED':'DISABLED';wl.style.color=d.watchdogEnabled?'#2e7d32':'#999';}
-            upd('uptime',d.uptime);upd('mac',d.macAddress);
-            document.getElementById('lastUpdate').textContent='Last update: '+new Date().toLocaleTimeString();
-        }).catch(()=>{errs++;if(errs>=3)conn(false);});}
-        function saveName(){const n=document.getElementById('nameInput').value.trim(),m=document.getElementById('nameMsg');
+    (function(){
+        var errs=0;
+        var IP='192.168.4.1';
+
+        function $(id){return document.getElementById(id);}
+        function upd(id,v){var e=$(id);if(e&&e.textContent!==String(v))e.textContent=v;}
+        function conn(ok){var b=$('connBadge');b.textContent=ok?'Connected':'Disconnected';b.className='badge '+(ok?'ok':'err');if(ok)errs=0;}
+
+        function signalInfo(rsrp){
+            var v=parseFloat(rsrp);
+            // RSRP is always negative (typical range: -60 to -140 dBm)
+            // A value of 0 or positive means "no data yet"
+            if(isNaN(v)||v>=0)return{pct:0,clr:'#ccc',txt:'--'};
+            if(v>=-80)return{pct:100,clr:'#4CAF50',txt:'Excellent'};
+            if(v>=-90)return{pct:75,clr:'#8BC34A',txt:'Good'};
+            if(v>=-100)return{pct:50,clr:'#FF9800',txt:'Fair'};
+            return{pct:25,clr:'#f44336',txt:'Poor'};
+        }
+
+        function poll(){
+            var x=new XMLHttpRequest();
+            x.timeout=4000;
+            x.onreadystatechange=function(){
+                if(x.readyState!==4)return;
+                if(x.status===200){
+                    try{
+                        var d=JSON.parse(x.responseText);
+                        conn(true);
+                        var ss=$('serialStatus');
+                        if(d.serialActive){ss.textContent='Receiving Data';ss.className='val ok-text';}
+                        else{ss.textContent='No Data';ss.className='val err-text';}
+                        upd('deviceId',d.deviceName||'--');
+                        upd('pressure',d.pressure);upd('current',d.current);upd('mode',d.mode);
+                        upd('cycles',d.cycles);
+                        var fe=$('fault');if(fe){fe.textContent=d.fault||'0';fe.className='val'+(parseInt(d.fault)>0?' warn-text':'');}
+                        var le=$('lteStatus');
+                        if(d.lteConnected){le.innerHTML='<span class=ok-text>Connected</span>';}
+                        else{le.innerHTML='<span class=err-text>Disconnected</span>';}
+                        upd('rsrp',d.rsrp+' dBm');upd('rsrq',d.rsrq+' dB');
+                        var si=signalInfo(d.rsrp);upd('signalLevel',si.txt);
+                        var bar=$('signalBar');if(bar){bar.style.width=si.pct+'%%';bar.style.background=si.clr;}
+                        upd('operator',d.operator||'--');upd('band',d.band||'--');
+                        upd('mccmnc',d.mcc&&d.mnc?(d.mcc+'/'+d.mnc):'--');
+                        upd('cellId',d.cellId||'--');
+                        var bc=$('blueCherry');
+                        if(d.blueCherryConnected){bc.innerHTML='<span class=ok-text>Connected</span>';}
+                        else{bc.innerHTML='<span class=warn-text>Offline</span>';}
+                        upd('version',d.version);upd('temperature',d.temperature+' F');
+                        var sd=$('sdCard');
+                        if(d.sdCardOK){sd.innerHTML='<span class=ok-text>OK</span>';}
+                        else{sd.innerHTML='<span class=err-text>FAULT</span>';}
+                        var ov=$('overfill');
+                        if(d.overfillAlarm){ov.innerHTML='<span class=err-text>ALARM</span>';}
+                        else{ov.innerHTML='<span class=ok-text>Normal</span>';}
+                        upd('i2cTx',d.i2cTransactions);upd('i2cErr',d.i2cErrors);
+                        upd('watchdog',d.watchdogEnabled?'Enabled':'Disabled');
+                        var wt=$('wdToggle'),wl=$('wdLabel');
+                        if(wt)wt.checked=d.watchdogEnabled;
+                        if(wl){wl.textContent=d.watchdogEnabled?'ENABLED':'DISABLED';wl.style.color=d.watchdogEnabled?'#2e7d32':'#999';}
+                        upd('uptime',d.uptime);upd('mac',d.macAddress);
+                        $('lastUpdate').textContent='Updated: '+new Date().toLocaleTimeString();
+                    }catch(e){errs++;if(errs>=3)conn(false);}
+                }else{errs++;if(errs>=3)conn(false);}
+            };
+            x.onerror=function(){errs++;if(errs>=3)conn(false);};
+            x.ontimeout=function(){errs++;if(errs>=3)conn(false);};
+            x.open('GET','http://'+IP+'/api/status',true);
+            x.send();
+        }
+
+        // Configuration functions - attached to window for onclick handlers
+        window.saveName=function(){
+            var n=$('nameInput').value.replace(/^\s+|\s+$/g,''),m=$('nameMsg');
             if(n.length<3||n.length>20){m.textContent='3-20 chars required';m.style.color='#c62828';return;}
             m.textContent='Saving...';m.style.color='#666';
-            fetch('/setdevicename?name='+encodeURIComponent(n)).then(r=>r.text()).then(()=>{
-                m.textContent='Saved!';m.style.color='#2e7d32';setTimeout(()=>m.textContent='',3000);});}
-        function setWatchdog(on){fetch('/setwatchdog?enabled='+(on?'1':'0')).then(()=>{
-            document.getElementById('wdLabel').textContent=on?'ENABLED':'DISABLED';
-            document.getElementById('wdLabel').style.color=on?'#2e7d32':'#999';});}
-        function togglePassthrough(){document.getElementById('ptModal').style.display='flex';}
-        function closePtModal(){document.getElementById('ptModal').style.display='none';}
-        function confirmPassthrough(){closePtModal();
-            const b=document.getElementById('ptBtn'),s=document.getElementById('ptStatus');
+            var x=new XMLHttpRequest();
+            x.open('GET','http://'+IP+'/setdevicename?name='+encodeURIComponent(n),true);
+            x.onload=function(){m.textContent='Saved!';m.style.color='#2e7d32';setTimeout(function(){m.textContent='';},3000);};
+            x.onerror=function(){m.textContent='Error';m.style.color='#c62828';};
+            x.send();
+        };
+        window.setWatchdog=function(on){
+            var x=new XMLHttpRequest();
+            x.open('GET','http://'+IP+'/setwatchdog?enabled='+(on?'1':'0'),true);
+            x.onload=function(){
+                $('wdLabel').textContent=on?'ENABLED':'DISABLED';
+                $('wdLabel').style.color=on?'#2e7d32':'#999';
+            };
+            x.send();
+        };
+        window.showPtModal=function(){$('ptModal').style.display='flex';};
+        window.closePtModal=function(){$('ptModal').style.display='none';};
+        window.confirmPassthrough=function(){
+            closePtModal();
+            var b=$('ptBtn'),s=$('ptStatus');
             s.textContent='Activating...';s.style.color='#e65100';b.disabled=true;
-            fetch('/setpassthrough?enabled=1').then(r=>r.text()).then(()=>{
-                s.textContent='Restarting...';s.style.color='#c62828';
-            }).catch(()=>{s.textContent='Sent (ESP32 restarting)';s.style.color='#e65100';});}
-        document.addEventListener('DOMContentLoaded',function(){if(document.activeElement)document.activeElement.blur();});
-        poll();setInterval(poll,2000);
+            var x=new XMLHttpRequest();
+            x.open('GET','http://'+IP+'/setpassthrough?enabled=1',true);
+            x.onload=function(){s.textContent='Restarting...';s.style.color='#c62828';};
+            x.onerror=function(){s.textContent='Sent (ESP32 restarting)';s.style.color='#e65100';};
+            x.send();
+        };
+
+        // Start polling immediately, then every 2 seconds
+        poll();
+        setInterval(poll,2000);
+    })();
     </script>
 </body>
 </html>
@@ -1524,12 +1581,15 @@ const char* control_html = R"rawliteral(
 // =====================================================================
 // WEB PROCESSOR FUNCTION
 // =====================================================================
-// This function handles template variable substitution in the HTML
-// It replaces %VARIABLE% placeholders with actual values
+// Handles %VARIABLE% template substitution in the HTML
+// Template variables use single %: %DEVICENAME% -> replaced with actual value
+// Literal percent signs in CSS/JS use double %%: 100%% -> renders as 100%
+// The processor sees "DEVICENAME" (without percent signs) as the variable name
+// IMPORTANT: return String() (not "") to leave unrecognized variables untouched
 
 String webProcessor(const String& var) {
     if (var == "DEVICENAME") return DeviceName;
-    return "";
+    return String();  // Return empty String object for unknown variables
 }
 
 // =====================================================================
@@ -1814,16 +1874,39 @@ void initializeAPName() {
     }
 }
 
+/**
+ * Start the WiFi Access Point and configure the captive portal web server.
+ * 
+ * CAPTIVE PORTAL STRATEGY (Rock-Solid):
+ * ============================================================
+ * Different OS detect captive portals by probing specific URLs:
+ *   iOS/macOS:  GET /hotspot-detect.html  (expects non-"Success" body)
+ *   Android:    GET /generate_204         (expects non-204 response)
+ *   Windows:    GET /connecttest.txt      (expects non-"Microsoft" body)
+ *               GET /ncsi.txt             (NCSI probe)
+ *               GET /fwlink               (redirect target)
+ *   Firefox:    GET /canonical.html       (expects non-canonical body)
+ * 
+ * The DNS server resolves ALL domains to 192.168.4.1, so these
+ * probes arrive at our server. We respond with a lightweight
+ * redirect page to force the captive portal popup to open.
+ * 
+ * CRITICAL FIX (Rev 9.4b): All literal % in HTML must be escaped as %%
+ * when using send_P() with a processor function. Otherwise the template
+ * engine eats chunks of HTML between % signs -> blank page!
+ */
 void startConfigAP() {
+    // Configure WiFi AP with explicit settings for reliability
+    WiFi.mode(WIFI_AP);
     WiFi.softAP(apSSID);
+    delay(100);  // Let AP stabilize before starting DNS
+    
+    // Start DNS server - resolve ALL domain lookups to our IP
+    // This is what makes captive portal detection work
     dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
     
-    // Simple test page (for debugging blank page issues)
-    server.on("/test", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send(200, "text/html", "<html><body><h1>Server Working!</h1><p>If you see this, the server is running.</p><p><a href='/'>Go to main page</a></p></body></html>");
-    });
-    
-    // Main diagnostic dashboard page (read-only, no relay control)
+    // ---- MAIN DASHBOARD PAGE ----
+    // Uses send_P with template processor for %%DEVICENAME%% substitution
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
         request->send_P(200, "text/html", control_html, webProcessor);
     });
@@ -1940,10 +2023,10 @@ void startConfigAP() {
             snprintf(uptimeStr, sizeof(uptimeStr), "%luh %lum", hours, minutes);
         }
         
-        // Get signal quality strings (updated by syncBlueCherry)
-        String rsrpStr = modemRSRP.length() > 0 ? modemRSRP : "0";
-        String rsrqStr = modemRSRQ.length() > 0 ? modemRSRQ : "0";
-        String operatorStr = modemNetName.length() > 0 ? modemNetName : "Unknown";
+        // Get signal quality strings (updated by refreshCellSignalInfo every 60s)
+        String rsrpStr = modemRSRP.length() > 0 ? modemRSRP : "--";
+        String rsrqStr = modemRSRQ.length() > 0 ? modemRSRQ : "--";
+        String operatorStr = modemNetName.length() > 0 ? modemNetName : "--";
         String bandStr = modemBand.length() > 0 ? modemBand : "--";
         
         // Build JSON response with all diagnostic fields
@@ -1962,6 +2045,9 @@ void startConfigAP() {
         json += "\"rsrq\":\"" + rsrqStr + "\",";
         json += "\"operator\":\"" + operatorStr + "\",";
         json += "\"band\":\"" + bandStr + "\",";
+        json += "\"mcc\":" + String(modemCC) + ",";
+        json += "\"mnc\":" + String(modemNC) + ",";
+        json += "\"cellId\":" + String(modemCID) + ",";
         json += "\"blueCherryConnected\":" + String(blueCherryConnected ? "true" : "false") + ",";
         // IO Board status
         json += "\"version\":\"" + ver + "\",";
@@ -1978,40 +2064,90 @@ void startConfigAP() {
         request->send(200, "application/json", json);
     });
     
-    // Captive portal redirects - serve lightweight page for iOS/Android captive portal detection
-    // The full control_html is too large for captive portal popups, so redirect to main page
-    server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send(200, "text/html", 
-            "<html><head><meta http-equiv='refresh' content='0;url=http://192.168.4.1/'></head>"
-            "<body style='font-family:Arial;text-align:center;padding:50px'>"
-            "<h1>Walter IO Board</h1>"
-            "<p><a href='http://192.168.4.1/'>Open Control Panel</a></p>"
-            "<p style='color:#666;font-size:12px'>Or open Safari and go to 192.168.4.1</p>"
-            "</body></html>");
-    });
-    server.on("/fwlink", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send(200, "text/html", 
-            "<html><head><meta http-equiv='refresh' content='0;url=http://192.168.4.1/'></head>"
-            "<body style='font-family:Arial;text-align:center;padding:50px'>"
-            "<h1>Walter IO Board</h1>"
-            "<p><a href='http://192.168.4.1/'>Open Control Panel</a></p>"
-            "</body></html>");
-    });
+    // ---- CAPTIVE PORTAL DETECTION HANDLERS ----
+    // Each OS/browser probes a specific URL to detect captive portals.
+    // We serve a lightweight redirect page that works inside the captive portal popup.
+    // Using inline HTML (no processor) to keep it tiny and fast.
+    
+    // Lightweight captive portal redirect page (used by all CP handlers below)
+    // Served inline - no template processor needed, no %% escaping issues
+    static const char CP_PAGE[] PROGMEM = 
+        "<!DOCTYPE html><html><head>"
+        "<meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Walter IO Board</title>"
+        "<style>body{font-family:-apple-system,Arial,sans-serif;text-align:center;padding:40px 20px;background:#f0f2f5;}"
+        "h2{color:#1a1a2e;margin-bottom:10px;}p{color:#666;margin:8px 0;}"
+        "a{display:inline-block;margin-top:15px;padding:12px 30px;background:#1565c0;color:#fff;"
+        "text-decoration:none;border-radius:6px;font-weight:bold;font-size:1.1em;}"
+        "a:active{background:#0d47a1;}.hint{font-size:12px;color:#999;margin-top:20px;}</style>"
+        "</head><body>"
+        "<h2>Walter IO Board</h2>"
+        "<p>Service Diagnostic Dashboard</p>"
+        "<a href='http://192.168.4.1/'>Open Dashboard</a>"
+        "<p class='hint'>If the page doesn't load, open your browser<br>and go to <b>192.168.4.1</b></p>"
+        "</body></html>";
+    
+    // Apple iOS / macOS captive portal detection
+    // iOS probes http://captive.apple.com/hotspot-detect.html
+    // If response is NOT "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"
+    // then iOS opens the captive portal popup. We return our redirect page.
     server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send(200, "text/html", 
-            "<html><head><meta http-equiv='refresh' content='0;url=http://192.168.4.1/'></head>"
-            "<body><a href='http://192.168.4.1/'>Open Control Panel</a></body></html>");
+        request->send_P(200, "text/html", CP_PAGE);
     });
     
+    // Android captive portal detection
+    // Android probes http://connectivitycheck.gstatic.com/generate_204
+    // Expects HTTP 204 No Content. Any other response triggers captive portal popup.
+    // We return 200 with our redirect page to force the popup open.
+    server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send_P(200, "text/html", CP_PAGE);
+    });
+    
+    // Windows NCSI (Network Connectivity Status Indicator) probes
+    server.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send_P(200, "text/html", CP_PAGE);
+    });
+    server.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send_P(200, "text/html", CP_PAGE);
+    });
+    server.on("/fwlink", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send_P(200, "text/html", CP_PAGE);
+    });
+    server.on("/redirect", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send_P(200, "text/html", CP_PAGE);
+    });
+    
+    // Firefox captive portal detection
+    server.on("/canonical.html", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send_P(200, "text/html", CP_PAGE);
+    });
+    
+    // Additional common captive portal probe URLs
+    server.on("/success.txt", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send_P(200, "text/html", CP_PAGE);
+    });
+    server.on("/chat", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send_P(200, "text/html", CP_PAGE);
+    });
+    
+    // ---- CATCH-ALL HANDLER ----
+    // Any URL not explicitly handled above gets redirected to the dashboard.
+    // This catches all OS-specific probe URLs we might have missed.
     server.onNotFound([](AsyncWebServerRequest *request){
-        // For unknown URLs, redirect to main page
-        request->redirect("http://192.168.4.1/");
+        // Use 302 redirect for standard HTTP requests
+        if (request->method() == HTTP_GET) {
+            request->redirect("http://192.168.4.1/");
+        } else {
+            request->send(200);  // Accept other methods silently
+        }
     });
     
     server.begin();
-    Serial.println("Async web server started");
-    Serial.print("AP IP address: ");
+    Serial.println("[WiFi] Web server started - captive portal active");
+    Serial.print("[WiFi] AP IP: ");
     Serial.println(WiFi.softAPIP());
+    Serial.printf("[WiFi] AP SSID: %s\n", apSSID);
     delay(100);
 }
 
@@ -2108,6 +2244,73 @@ void updateTimestamp() {
     lastMillis = nowMillis;
 }
 
+/**
+ * Check if the current UTC time falls within the firmware check schedule.
+ * 
+ * SCHEDULE (Eastern Standard Time, UTC-5):
+ *   - First check at 7:00 AM EST (12:00 UTC)
+ *   - Every 15 minutes: 7:00, 7:15, 7:30, 7:45, 8:00, ... 12:45 PM
+ *   - Last check at 1:00 PM EST (18:00 UTC)
+ *   - No checks outside this window
+ * 
+ * Returns true if we are inside a 15-minute check slot that hasn't been
+ * serviced yet. Uses firmwareCheckDoneThisSlot to prevent duplicate checks
+ * within the same slot.
+ * 
+ * @return true if a firmware check should run now
+ * 
+ * Usage: Called every loop iteration; only returns true once per 15-min slot
+ *   if (isFirmwareCheckScheduled()) { checkFirmwareUpdate(); initModemTime(); }
+ */
+bool isFirmwareCheckScheduled() {
+    // Need valid time from modem (currentTimestamp > 0 means modem time was set)
+    if (currentTimestamp <= 0) return false;
+    
+    // Convert UTC epoch to broken-down time
+    time_t rawTime = (time_t)currentTimestamp;
+    struct tm *utcTime = gmtime(&rawTime);
+    
+    // Convert UTC hour/minute to EST (UTC - 5 hours)
+    // Handle day wraparound (e.g., UTC 03:00 = EST 22:00 previous day)
+    int estHour = utcTime->tm_hour - 5;
+    int estMinute = utcTime->tm_min;
+    if (estHour < 0) estHour += 24;
+    
+    // Calculate total minutes since midnight EST for easy comparison
+    int estTotalMinutes = estHour * 60 + estMinute;
+    
+    // Schedule window: 7:00 AM EST (420 min) to 1:00 PM EST (780 min)
+    const int SCHEDULE_START = 7 * 60;       // 7:00 AM = 420 minutes
+    const int SCHEDULE_END   = 13 * 60;      // 1:00 PM = 780 minutes
+    const int CHECK_INTERVAL = 15;           // Every 15 minutes
+    
+    // Outside the schedule window? No check needed.
+    if (estTotalMinutes < SCHEDULE_START || estTotalMinutes > SCHEDULE_END) {
+        firmwareCheckDoneThisSlot = false;  // Reset for next day's window
+        return false;
+    }
+    
+    // Calculate which 15-minute slot we're in (0 = 7:00, 1 = 7:15, 2 = 7:30, ...)
+    int currentSlot = (estTotalMinutes - SCHEDULE_START) / CHECK_INTERVAL;
+    
+    // We're in a valid slot. Have we already checked this slot?
+    // Use a static to track which slot was last serviced
+    static int lastCheckedSlot = -1;
+    
+    if (currentSlot == lastCheckedSlot && firmwareCheckDoneThisSlot) {
+        return false;  // Already checked this slot
+    }
+    
+    // New slot! Mark it and return true
+    lastCheckedSlot = currentSlot;
+    firmwareCheckDoneThisSlot = true;
+    
+    Serial.printf("[SCHEDULE] Firmware check triggered at %02d:%02d EST (slot %d of %d)\r\n",
+                  estHour, estMinute, currentSlot, (SCHEDULE_END - SCHEDULE_START) / CHECK_INTERVAL);
+    
+    return true;
+}
+
 String formatTimestamp(int64_t seconds) {
     time_t rawTime = (time_t)seconds;
     struct tm *timeInfo = gmtime(&rawTime);
@@ -2158,22 +2361,30 @@ void sendStatusToSerial() {
     // Check LTE connection status
     int lteStatus = lteConnected() ? 1 : 0;
     
-    // Get signal quality - use stored values (updated by syncBlueCherry)
-    // modemRSRP and modemRSRQ are global strings updated when cell info is retrieved
-    String rsrpStr = modemRSRP.length() > 0 ? modemRSRP : "0";
-    String rsrqStr = modemRSRQ.length() > 0 ? modemRSRQ : "0";
+    // Get signal quality - use stored values (updated by refreshCellSignalInfo every 60s)
+    String rsrpStr = modemRSRP.length() > 0 ? modemRSRP : "--";
+    String rsrqStr = modemRSRQ.length() > 0 ? modemRSRQ : "--";
+    String operatorStr = modemNetName.length() > 0 ? modemNetName : "--";
+    String bandStr = modemBand.length() > 0 ? modemBand : "--";
     
-    // Build JSON string
-    // Using snprintf for efficiency and to avoid String concatenation overhead
-    char jsonBuffer[200];
+    // Build JSON string with all cellular info including cell tower data
+    // Sent every 15 seconds to modem.py on Linux device via Serial1 (RS-232)
+    // Fields: datetime, sdcard, passthrough, lte, rsrp, rsrq, operator, band, mcc, mnc, cellId
+    char jsonBuffer[350];
     snprintf(jsonBuffer, sizeof(jsonBuffer),
-             "{\"datetime\":\"%s\",\"sdcard\":\"%s\",\"passthrough\":%d,\"lte\":%d,\"rsrp\":\"%s\",\"rsrq\":\"%s\"}",
+             "{\"datetime\":\"%s\",\"sdcard\":\"%s\",\"passthrough\":%d,"
+             "\"lte\":%d,\"rsrp\":\"%s\",\"rsrq\":\"%s\","
+             "\"operator\":\"%s\",\"band\":\"%s\","
+             "\"mcc\":%u,\"mnc\":%u,\"cellId\":%u}",
              dateTimeStr.c_str(),
              sdStatus.c_str(),
              passthroughValue,
              lteStatus,
              rsrpStr.c_str(),
-             rsrqStr.c_str());
+             rsrqStr.c_str(),
+             operatorStr.c_str(),
+             bandStr.c_str(),
+             modemCC, modemNC, modemCID);
     
     // Send to Python device via Serial1 (RS-232)
     Serial1.println(jsonBuffer);
@@ -2778,6 +2989,18 @@ bool lteConnect() {
                       rsp.data.cellInformation.netName, rsp.data.cellInformation.cc, rsp.data.cellInformation.nc);
         Serial.printf("Signal strength: RSRP: %.2f, RSRQ: %.2f\r\n", rsp.data.cellInformation.rsrp, rsp.data.cellInformation.rsrq);
         Modem_Status = "Modem OK ";
+        
+        // Store cell info in globals for web dashboard and serial JSON output
+        modemBand = String(rsp.data.cellInformation.band);
+        modemNetName = String(rsp.data.cellInformation.netName);
+        modemRSRP = String(rsp.data.cellInformation.rsrp, 1);   // e.g. "-89.5"
+        modemRSRQ = String(rsp.data.cellInformation.rsrq, 1);   // e.g. "-11.2"
+        modemCC = rsp.data.cellInformation.cc;                    // Country Code (e.g. 310)
+        modemNC = rsp.data.cellInformation.nc;                    // Network Code (e.g. 260)
+        modemCID = rsp.data.cellInformation.cid;                  // Cell Tower ID
+        Serial.printf("[CELL] Band=%s, Op=%s, RSRP=%s, RSRQ=%s, MCC=%u, MNC=%02u, CID=%u\r\n",
+                      modemBand.c_str(), modemNetName.c_str(), modemRSRP.c_str(), modemRSRQ.c_str(),
+                      modemCC, modemNC, modemCID);
     }
     
     Serial.println("LTE connection established successfully");
@@ -2981,15 +3204,27 @@ size_t buildCborFromReadings(uint8_t* buf, size_t bufSize, int data[][10], size_
   return len;
 }
 
-void buildStatusUpdate() {
+/**
+ * Refresh cell signal information from the modem.
+ * Updates global strings: modemBand, modemNetName, modemRSRP, modemRSRQ
+ * 
+ * Called periodically (every 60s) to keep web dashboard and serial JSON current.
+ * Also called by buildStatusCbor before sending CBOR data to BlueCherry.
+ * 
+ * Usage: refreshCellSignalInfo();  // Updates globals, no return value
+ */
+void refreshCellSignalInfo() {
     if (modem.getCellInformation(WALTER_MODEM_SQNMONI_REPORTS_SERVING_CELL, &rsp)) {
-        modemBand = rsp.data.cellInformation.band;
-        modemNetName = rsp.data.cellInformation.netName;
-        modemRSRP = rsp.data.cellInformation.rsrp;
-        modemRSRQ = rsp.data.cellInformation.rsrq;
-    } else {
-        modemBand = modemNetName = modemRSRP = modemRSRQ = "Unknown";
+        modemBand = String(rsp.data.cellInformation.band);
+        modemNetName = String(rsp.data.cellInformation.netName);
+        modemRSRP = String(rsp.data.cellInformation.rsrp, 1);   // e.g. "-89.5"
+        modemRSRQ = String(rsp.data.cellInformation.rsrq, 1);   // e.g. "-11.2"
+        modemCC = rsp.data.cellInformation.cc;                    // Country Code (e.g. 310)
+        modemNC = rsp.data.cellInformation.nc;                    // Network Code (e.g. 260)
+        modemCID = rsp.data.cellInformation.cid;                  // Cell Tower ID
     }
+    // On failure, keep previous values rather than overwriting with "Unknown"
+    // This prevents dashboard from flickering between real data and "Unknown"
 }
 
 size_t buildErrorCbor(uint8_t* cborBuf, size_t bufSize, int errorCode) {
@@ -3166,7 +3401,7 @@ bool sendErrorMessageViaSocket() {
 }
 
 bool sendStatusUpdateViaSocket() {
-    buildStatusUpdate();
+    refreshCellSignalInfo();
     size_t cborSize = buildStatusCbor(cborBuffer, sizeof(cborBuffer));
     if (cborSize == 0) {
         Serial.println("Failed to build status CBOR message");
@@ -3406,7 +3641,7 @@ void setup() {
     delay(500);
     
     Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-    Serial.println("║  Walter IO Board Firmware - Rev 9.4                  ║");
+    Serial.println("║  Walter IO Board Firmware - Rev 9.4d                 ║");
     Serial.println("║  MCP23017 Emulation + Diagnostic Dashboard           ║");
     Serial.println("╚═══════════════════════════════════════════════════════╝\n");
     
@@ -3545,8 +3780,6 @@ void setup() {
     
     if (modem.getIdentity(&rsp)) {
         imei = rsp.data.identity.imei;
-        imeisv = rsp.data.identity.imeisv;
-        svn = rsp.data.identity.svn;
     }
     
     // Read MAC address AFTER BlueCherry init (matching original code structure)
@@ -3582,7 +3815,7 @@ void setup() {
     resetSerialWatchdog();
     Serial.println("✓ Serial watchdog timer initialized");
     
-    Serial.println("\n✅ Walter IO Board Firmware Rev 9.4 initialization complete!");
+    Serial.println("\n✅ Walter IO Board Firmware Rev 9.4d initialization complete!");
     Serial.println("✅ MCP I2C slave running on Core 0 (address 0x20)");
     Serial.println("✅ AJAX web interface active (no refresh flashing)");
     Serial.println("✅ Serial watchdog ready");
@@ -3646,7 +3879,7 @@ void loop() {
         parsedSerialData();
         lastParseTime = currentTime;
     }
-    
+    // Send normal CBOR Payload
     if (currentTime - lastSendTime >= sendInterval) {
         buildSendDataArray();
         Serial.print("*** Reading Count= ");
@@ -3660,18 +3893,26 @@ void loop() {
         firstLostComm = 0;
     }
     
-    if (currentTime - lastFirmwareTime >= lastFirmwareFreq || firstTime) {
-        Serial.println("%%%%%%%%%%%% Firmware check - init Modem time %%%%%%%%%%%%%%%%%%%%%%%%%%%");
+    // =====================================================================
+    // SCHEDULED FIRMWARE CHECK (7:00 AM - 1:00 PM EST, every 15 min)
+    // Also runs once on first boot to sync modem time and check for updates
+    // =====================================================================
+    if (firstTime || isFirmwareCheckScheduled()) {
+        Serial.println("[FIRMWARE] Scheduled check - syncing modem time & checking updates");
         checkFirmwareUpdate();
         initModemTime();
-        lastFirmwareTime = currentTime;
+        lastFirmwareCheckMillis = currentTime;
         firstTime = false;
         
         // Check if weekly restart is needed (only if BlueCherry never connected)
         checkWeeklyRestartForBlueCherry();
     }
     
+    // Refresh cell signal info every 60 seconds for web dashboard and serial JSON
+    // This updates modemRSRP, modemRSRQ, modemBand, modemNetName globals
     if (currentTime - lastSDCheck >= 60000) {
+        refreshCellSignalInfo();
+        
         if (!SD.cardType()) {
             Serial.println("SD card not mounted, attempting to remount");
             int attempts = 0;

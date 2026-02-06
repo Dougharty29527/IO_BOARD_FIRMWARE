@@ -8,7 +8,9 @@ JSON Format (Outgoing to ESP32):
     {"type":"data","gmid":"CSX-1234","press":-14.22,"mode":0,"current":0.07,"fault":0,"cycles":484}
 
 JSON Format (Incoming from ESP32 - Status):
-    {"datetime":"2026-01-29 12:34:56","sdcard":"OK","passthrough":0,"lte":1,"rsrp":"-85.5","rsrq":"-10.2"}
+    {"datetime":"2026-01-29 12:34:56","sdcard":"OK","passthrough":0,
+     "lte":1,"rsrp":"-85.5","rsrq":"-10.2",
+     "operator":"T-Mobile","band":"12","mcc":310,"mnc":260,"cellId":12345678}
     
     - datetime: Current timestamp from modem (UTC)
     - sdcard: "OK" or "FAULT" 
@@ -16,6 +18,11 @@ JSON Format (Incoming from ESP32 - Status):
     - lte: 1=connected to LTE network, 0=not connected
     - rsrp: Signal strength in dBm (typical: -80 excellent, -100 poor)
     - rsrq: Signal quality in dB (typical: -10 good, -20 poor)
+    - operator: Network operator name (e.g. "T-Mobile", "AT&T")
+    - band: LTE band number (e.g. "12", "4", "66")
+    - mcc: Mobile Country Code (e.g. 310 for US)
+    - mnc: Mobile Network Code (e.g. 260 for T-Mobile US)
+    - cellId: Cell Tower ID - unique ID of the serving cell tower
 
 JSON Format (Incoming from ESP32 - Passthrough Request):
     {"passthrough":"remote 60"}
@@ -96,6 +103,13 @@ class SerialManager:
         self.esp32_lte_connected = False # True if connected to LTE network
         self.esp32_rsrp = None           # Signal strength in dBm (e.g., -85.5)
         self.esp32_rsrq = None           # Signal quality in dB (e.g., -10.2)
+        
+        # Cell tower information (received from IO Board)
+        self.esp32_operator = None       # Network operator name (e.g. "T-Mobile")
+        self.esp32_band = None           # LTE band number (e.g. "12")
+        self.esp32_mcc = None            # Mobile Country Code (e.g. 310 for US)
+        self.esp32_mnc = None            # Mobile Network Code (e.g. 260 for T-Mobile)
+        self.esp32_cell_id = None        # Cell Tower ID (unique cell identifier)
         
         # Passthrough mode callback (called when passthrough value changes)
         # Set this to a function that takes (old_value, new_value) as arguments
@@ -495,16 +509,26 @@ class SerialManager:
         Check for and parse incoming JSON status from ESP32.
         
         Expected JSON format:
-            {"datetime":"2026-01-29 12:34:56","sdcard":"OK","passthrough":0}
+            {"datetime":"2026-01-29 12:34:56","sdcard":"OK","passthrough":0,
+             "lte":1,"rsrp":"-85.5","rsrq":"-10.2",
+             "operator":"T-Mobile","band":"12","mcc":310,"mnc":260,"cellId":12345678}
         
         Returns:
             dict: Parsed status data, or None if no data available
             
         Updates instance variables:
-            - self.esp32_datetime
-            - self.esp32_sdcard_status  
-            - self.esp32_passthrough
-            - self.esp32_last_update
+            - self.esp32_datetime        - Modem timestamp (UTC)
+            - self.esp32_sdcard_status   - "OK" or "FAULT"
+            - self.esp32_passthrough     - 0=normal, 1=active
+            - self.esp32_lte_connected   - LTE connection status
+            - self.esp32_rsrp            - Signal strength (dBm)
+            - self.esp32_rsrq            - Signal quality (dB)
+            - self.esp32_operator        - Network operator name
+            - self.esp32_band            - LTE band number
+            - self.esp32_mcc             - Mobile Country Code
+            - self.esp32_mnc             - Mobile Network Code
+            - self.esp32_cell_id         - Cell Tower ID
+            - self.esp32_last_update     - time.time() of update
             
         Triggers on_passthrough_change callback if passthrough value changes.
         '''
@@ -579,15 +603,44 @@ class SerialManager:
             # Parse signal quality (RSRP and RSRQ)
             if 'rsrp' in data:
                 try:
-                    self.esp32_rsrp = float(data['rsrp'])
+                    val = data['rsrp']
+                    self.esp32_rsrp = float(val) if val != '--' else None
                 except (ValueError, TypeError):
                     self.esp32_rsrp = None
                     
             if 'rsrq' in data:
                 try:
-                    self.esp32_rsrq = float(data['rsrq'])
+                    val = data['rsrq']
+                    self.esp32_rsrq = float(val) if val != '--' else None
                 except (ValueError, TypeError):
                     self.esp32_rsrq = None
+            
+            # Parse cell tower information
+            if 'operator' in data:
+                val = data['operator']
+                self.esp32_operator = val if val != '--' else None
+                
+            if 'band' in data:
+                val = data['band']
+                self.esp32_band = val if val != '--' else None
+                
+            if 'mcc' in data:
+                try:
+                    self.esp32_mcc = int(data['mcc']) if data['mcc'] else None
+                except (ValueError, TypeError):
+                    self.esp32_mcc = None
+                    
+            if 'mnc' in data:
+                try:
+                    self.esp32_mnc = int(data['mnc']) if data['mnc'] else None
+                except (ValueError, TypeError):
+                    self.esp32_mnc = None
+                    
+            if 'cellId' in data:
+                try:
+                    self.esp32_cell_id = int(data['cellId']) if data['cellId'] else None
+                except (ValueError, TypeError):
+                    self.esp32_cell_id = None
                 
             self.esp32_last_update = time.time()
             
@@ -595,7 +648,10 @@ class SerialManager:
                               f'sdcard={self.esp32_sdcard_status}, '
                               f'passthrough={self.esp32_passthrough}, '
                               f'lte={self.esp32_lte_connected}, '
-                              f'rsrp={self.esp32_rsrp}, rsrq={self.esp32_rsrq}')
+                              f'rsrp={self.esp32_rsrp}, rsrq={self.esp32_rsrq}, '
+                              f'op={self.esp32_operator}, band={self.esp32_band}, '
+                              f'mcc={self.esp32_mcc}, mnc={self.esp32_mnc}, '
+                              f'cellId={self.esp32_cell_id}')
             
             # Trigger callback if passthrough status changed
             if self.esp32_passthrough != old_passthrough:
@@ -625,17 +681,22 @@ class SerialManager:
     
     def get_signal_quality(self):
         '''
-        Get cellular signal quality information.
+        Get cellular signal quality and cell tower information.
         
         Returns:
-            dict: Signal quality data, or None if not available
+            dict: Signal quality and tower data, or None if not available
             
         Example:
             {
-                'rsrp': -85.5,       # dBm (signal strength)
-                'rsrq': -10.2,       # dB (signal quality)
-                'quality': 'Good',   # Human-readable quality
-                'lte_connected': True
+                'rsrp': -85.5,          # dBm (signal strength)
+                'rsrq': -10.2,          # dB (signal quality)
+                'quality': 'Good',      # Human-readable quality
+                'lte_connected': True,
+                'operator': 'T-Mobile', # Network operator name
+                'band': '12',           # LTE band number
+                'mcc': 310,             # Mobile Country Code
+                'mnc': 260,             # Mobile Network Code
+                'cell_id': 12345678     # Cell Tower ID
             }
             
         Signal Quality Interpretation:
@@ -669,12 +730,56 @@ class SerialManager:
             'rsrp': self.esp32_rsrp,
             'rsrq': self.esp32_rsrq,
             'quality': quality,
-            'lte_connected': self.esp32_lte_connected
+            'lte_connected': self.esp32_lte_connected,
+            'operator': self.esp32_operator,
+            'band': self.esp32_band,
+            'mcc': self.esp32_mcc,
+            'mnc': self.esp32_mnc,
+            'cell_id': self.esp32_cell_id
         }
         
+    def get_cell_tower_info(self):
+        '''
+        Get cell tower identification information.
+        
+        Returns:
+            dict: Cell tower data, or None if not available
+            
+        Example:
+            {
+                'operator': 'T-Mobile',
+                'band': '12',
+                'mcc': 310,            # Mobile Country Code (310 = US)
+                'mnc': 260,            # Mobile Network Code (260 = T-Mobile)
+                'cell_id': 12345678,   # Unique cell tower identifier
+                'plmn': '310260'       # Combined MCC+MNC string
+            }
+            
+        Usage:
+            tower = manager.get_cell_tower_info()
+            if tower:
+                print(f"Connected to {tower['operator']} tower {tower['cell_id']}")
+        '''
+        if self.esp32_mcc is None and self.esp32_cell_id is None:
+            return None
+        
+        # Build PLMN (Public Land Mobile Network) identifier string
+        plmn = None
+        if self.esp32_mcc is not None and self.esp32_mnc is not None:
+            plmn = f'{self.esp32_mcc}{self.esp32_mnc:02d}'
+        
+        return {
+            'operator': self.esp32_operator,
+            'band': self.esp32_band,
+            'mcc': self.esp32_mcc,
+            'mnc': self.esp32_mnc,
+            'cell_id': self.esp32_cell_id,
+            'plmn': plmn
+        }
+
     def get_esp32_status(self):
         '''
-        Get current ESP32 status as dictionary.
+        Get current ESP32 status as dictionary including cell tower info.
         
         Returns:
             dict: Current status values, or None if never received
@@ -688,6 +793,11 @@ class SerialManager:
                 'rsrp': -85.5,
                 'rsrq': -10.2,
                 'signal_quality': 'Good',
+                'operator': 'T-Mobile',
+                'band': '12',
+                'mcc': 310,
+                'mnc': 260,
+                'cell_id': 12345678,
                 'last_update': 1738171234.567,
                 'age_seconds': 5.2
             }
@@ -696,7 +806,6 @@ class SerialManager:
             return None
         
         # Determine signal quality description based on RSRP
-        # RSRP: -80 or better = Excellent, -80 to -90 = Good, -90 to -100 = Fair, below -100 = Poor
         signal_quality = 'Unknown'
         if self.esp32_rsrp is not None:
             if self.esp32_rsrp >= -80:
@@ -716,6 +825,11 @@ class SerialManager:
             'rsrp': self.esp32_rsrp,
             'rsrq': self.esp32_rsrq,
             'signal_quality': signal_quality,
+            'operator': self.esp32_operator,
+            'band': self.esp32_band,
+            'mcc': self.esp32_mcc,
+            'mnc': self.esp32_mnc,
+            'cell_id': self.esp32_cell_id,
             'last_update': self.esp32_last_update,
             'age_seconds': round(time.time() - self.esp32_last_update, 1)
         }
